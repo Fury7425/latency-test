@@ -4,26 +4,79 @@ import json
 import time
 import threading
 import datetime
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
 
 import numpy as np
-from scipy import signal, fft
-
+from scipy import signal
 import pyaudio
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
 
-APP_TITLE = "Ear/Headset Latency Tester (with Lab)"
+APP_TITLE = "Latency Lab — Sleek + Lab"
 CALIBRATION_JSON = "calibration_per_sound.json"
 
+# -------------------------------
+# Presets
+# -------------------------------
+SOUND_PRESETS = [
+    {"key": "beep_1k", "name": "1 kHz Beep", "type": "sine", "freq": 1000},
+    {"key": "beep_2k", "name": "2 kHz Beep", "type": "sine", "freq": 2000},
+    {"key": "beep_5k", "name": "5 kHz Beep", "type": "sine", "freq": 5000},
+    {"key": "beep_200", "name": "200 Hz Beep", "type": "sine", "freq": 200},
+    {"key": "impulse", "name": "Click (Impulse)", "type": "impulse", "freq": None},
+]
 
 # -------------------------------
-# Utility
+# Config
 # -------------------------------
+def default_config():
+    return {
+        "global_system_offset_ms": 0.0,
+        "per_sound_offsets_ms": {p["key"]: 0.0 for p in SOUND_PRESETS},
+        "last_settings": {
+            "sample_rate": 44100,
+            "duration": 0.5,
+            "repeats": 5,
+            "input_device_index": None,
+            "output_device_index": None,
+            "output_dir": os.getcwd(),
+        },
+        "ui": {
+            "appearance_mode": "Dark",     # 'Light' | 'Dark' | 'System'
+            "color_theme": "blue",         # 'blue' | 'dark-blue' | 'green'
+        }
+    }
+
+def load_config(path=CALIBRATION_JSON):
+    cfg = default_config()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # deep merge with defaults
+            for k, v in data.items():
+                if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                    cfg[k].update(v)
+                else:
+                    cfg[k] = v
+            for p in SOUND_PRESETS:
+                cfg["per_sound_offsets_ms"].setdefault(p["key"], 0.0)
+        except Exception:
+            pass
+    return cfg
+
+def save_config(cfg, path=CALIBRATION_JSON):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
 def safe_mean(a):
     vals = [x for x in a if x is not None]
     return float(np.mean(vals)) if vals else None
@@ -44,7 +97,6 @@ def ensure_dir(d):
     os.makedirs(d, exist_ok=True)
     return d
 
-
 # -------------------------------
 # Audio Core
 # -------------------------------
@@ -57,6 +109,7 @@ class AudioCore:
         self.stream_output = None
         self.stream_input = None
         self.test_signal = None
+        self.recorded_audio = None
         self.output_device_index = output_device_index
         self.input_device_index = input_device_index
 
@@ -71,7 +124,6 @@ class AudioCore:
         self.output_device_index = output_index
         self.input_device_index = input_index
 
-    # --- Generators ---
     def generate_sine(self, freq=1000.0, duration=None, amp=0.8):
         if duration is None:
             duration = self.duration
@@ -99,7 +151,6 @@ class AudioCore:
         return self.test_signal
 
     def generate_pink_noise(self, duration=None, amp=0.3):
-        # Pink noise via 1/f shaping in frequency domain
         if duration is None:
             duration = self.duration
         n = int(self.sample_rate * duration)
@@ -115,7 +166,6 @@ class AudioCore:
     def generate_log_chirp(self, f0=20, f1=20000, duration=6.0, amp=0.5):
         t = np.linspace(0, duration, int(self.sample_rate * duration), endpoint=False)
         sig = signal.chirp(t, f0=f0, t1=duration, f1=f1, method='logarithmic') * amp
-        # fade in/out
         fade = int(0.02 * self.sample_rate)
         if fade > 0:
             sig[:fade] *= np.linspace(0, 1, fade)
@@ -123,7 +173,7 @@ class AudioCore:
         self.test_signal = sig.astype(np.float32)
         return self.test_signal, t
 
-    # --- Playback ---
+    # Playback
     def play_mono(self, sig):
         audio_data = (np.asarray(sig) * 32767).astype(np.int16)
         out = self.audio.open(format=pyaudio.paInt16, channels=1, rate=self.sample_rate, output=True, output_device_index=self.output_device_index)
@@ -142,7 +192,7 @@ class AudioCore:
         out.write(audio_data)
         out.stop_stream(); out.close()
 
-    # --- Record ---
+    # Record
     def record_audio(self, duration):
         inp = self.audio.open(format=pyaudio.paInt16, channels=1, rate=self.sample_rate, input=True, frames_per_buffer=self.chunk_size, input_device_index=self.input_device_index)
         frames = []
@@ -152,9 +202,9 @@ class AudioCore:
             frames.append(data)
         inp.stop_stream(); inp.close()
         audio_data = np.frombuffer(b"".join(frames), dtype=np.int16).astype(np.float32) / 32767.0
-        return audio_data
+        self.recorded_audio = audio_data
+        return self.recorded_audio
 
-    # --- Analysis ---
     @staticmethod
     def find_delay_ms(recorded_signal, reference_signal, sample_rate):
         if recorded_signal is None or reference_signal is None:
@@ -188,74 +238,24 @@ class AudioCore:
 
     def cleanup(self):
         try:
-            self.audio.terminate()
+            if self.audio:
+                self.audio.terminate()
+                self.audio = None
         except Exception:
             pass
 
-
 # -------------------------------
-# Presets & Config
-# -------------------------------
-SOUND_PRESETS = [
-    {"key": "beep_1k", "name": "1 kHz Beep", "type": "sine", "freq": 1000},
-    {"key": "beep_5k", "name": "5 kHz Beep", "type": "sine", "freq": 5000},
-    {"key": "beep_200", "name": "200 Hz Beep", "type": "sine", "freq": 200},
-    {"key": "beep_2k", "name": "2 kHz Beep", "type": "sine", "freq": 2000},
-    {"key": "impulse", "name": "Click (Impulse)", "type": "impulse", "freq": None},
-]
-
-def default_config():
-    return {
-        "global_system_offset_ms": 0.0,
-        "per_sound_offsets_ms": {p["key"]: 0.0 for p in SOUND_PRESETS},
-        "last_settings": {
-            "sample_rate": 44100,
-            "duration": 0.5,
-            "repeats": 5,
-            "input_device_index": None,
-            "output_device_index": None
-        }
-    }
-
-def load_config(path=CALIBRATION_JSON):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            cfg = default_config()
-            cfg.update(data)
-            for p in SOUND_PRESETS:
-                if p["key"] not in cfg["per_sound_offsets_ms"]:
-                    cfg["per_sound_offsets_ms"][p["key"]] = 0.0
-            return cfg
-        except Exception:
-            return default_config()
-    return default_config()
-
-def save_config(cfg, path=CALIBRATION_JSON):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-        return True
-    except Exception:
-        return False
-
-
-# -------------------------------
-# Delay Runner (original tests)
+# Delay Runner (measure/calibrate)
 # -------------------------------
 class DelayRunner:
     def __init__(self, cfg, log_fn):
         self.cfg = cfg
         self.log = log_fn
 
-    def _gen_signal(self, core: AudioCore, preset):
-        if preset["type"] == "sine":
-            return core.generate_sine(freq=preset["freq"], duration=core.duration)
-        else:
-            return core.generate_impulse()
+    def _gen(self, core, preset):
+        return core.generate_sine(preset["freq"]) if preset["type"] == "sine" else core.generate_impulse()
 
-    def run_single_measurement(self, core: AudioCore, preset, record_margin_s=1.0):
+    def run_once(self, core, preset, record_margin_s=1.0):
         rec_dur = float(core.duration) + float(record_margin_s)
         rec_data = {"audio": None}
 
@@ -264,157 +264,182 @@ class DelayRunner:
 
         t = threading.Thread(target=record_worker, daemon=True)
         t.start()
-        time.sleep(0.1)
+        time.sleep(0.08)  # ensure recording started
         core.play_mono(core.test_signal)
         t.join()
 
         delay_ms, _ = AudioCore.find_delay_ms(rec_data["audio"], core.test_signal, core.sample_rate)
         return delay_ms, rec_data["audio"], core.test_signal
 
-    def run_calibration_for_preset(self, core: AudioCore, preset, repeats=5):
-        self.log(f"[CAL] {preset['name']} - {repeats} runs")
+    def calibrate_preset(self, core, preset, repeats=5):
+        self.log(f"[CAL] {preset['name']} x{repeats}")
         delays = []
         for i in range(repeats):
-            self._gen_signal(core, preset)
-            d, _, _ = self.run_single_measurement(core, preset)
+            self._gen(core, preset)
+            d, _, _ = self.run_once(core, preset)
             if d is None:
-                self.log(f"  ✗ Run {i+1}/{repeats}: failed")
+                self.log(f"  ✗ {i+1}/{repeats}: failed")
             else:
-                self.log(f"  ✓ Run {i+1}/{repeats}: raw {d:.3f} ms")
+                self.log(f"  ✓ {i+1}/{repeats}: {d:.2f} ms")
             delays.append(d)
             time.sleep(0.2)
+        avg, std = safe_mean(delays), safe_std(delays)
+        if avg is not None:
+            self.cfg["per_sound_offsets_ms"][preset["key"]] = float(avg)
+            save_config(self.cfg)
+            self.log(f"  -> saved baseline {avg:.2f} ± {std:.2f} ms")
+        else:
+            self.log("  -> no successful runs")
+        return avg, std
 
-        avg = safe_mean(delays)
-        std = safe_std(delays)
-        if avg is None:
-            self.log("  -> No successful runs.")
-            return None
-        self.cfg["per_sound_offsets_ms"][preset["key"]] = float(avg)
-        save_config(self.cfg)
-        self.log(f"  -> Saved per-sound baseline: {avg:.3f} ms (std {std:.3f} ms)")
-        return avg
-
-    def run_global_system_calibration(self, core: AudioCore, repeats=10):
-        pseudo_preset = {"key": "impulse", "name": "System (Impulse)", "type": "impulse", "freq": None}
-        self.log(f"[CAL] Global offset via impulse - {repeats} runs")
+    def calibrate_global(self, core, repeats=10):
+        pseudo = {"key": "impulse", "name": "System (Impulse)", "type": "impulse", "freq": None}
+        self.log(f"[CAL] GLOBAL (Impulse) x{repeats}")
         delays = []
         for i in range(repeats):
-            self._gen_signal(core, pseudo_preset)
-            d, _, _ = self.run_single_measurement(core, pseudo_preset)
+            self._gen(core, pseudo)
+            d, _, _ = self.run_once(core, pseudo)
             if d is None:
-                self.log(f"  ✗ Run {i+1}/{repeats}: failed")
+                self.log(f"  ✗ {i+1}/{repeats}: failed")
             else:
-                self.log(f"  ✓ Run {i+1}/{repeats}: raw {d:.3f} ms")
+                self.log(f"  ✓ {i+1}/{repeats}: {d:.2f} ms")
             delays.append(d)
             time.sleep(0.2)
+        avg, std = safe_mean(delays), safe_std(delays)
+        if avg is not None:
+            self.cfg["global_system_offset_ms"] = float(avg)
+            save_config(self.cfg)
+            self.log(f"  -> saved GLOBAL {avg:.2f} ± {std:.2f} ms")
+        else:
+            self.log("  -> no successful runs")
+        return avg, std
 
-        avg = safe_mean(delays)
-        std = safe_std(delays)
-        if avg is None:
-            self.log("  -> No successful global calibration runs.")
-            return None
-        self.cfg["global_system_offset_ms"] = float(avg)
-        save_config(self.cfg)
-        self.log(f"  -> Saved GLOBAL system offset: {avg:.3f} ms (std {std:.3f} ms)")
-        return avg
-
-    def run_test_for_preset(self, core: AudioCore, preset, repeats=5, save_plot_dir=None):
-        self.log(f"[TEST] {preset['name']} - {repeats} runs")
+    def test_preset(self, core, preset, repeats=5, save_plot_dir=None):
+        self.log(f"[TEST] {preset['name']} x{repeats}")
         per_sound = self.cfg["per_sound_offsets_ms"].get(preset["key"], 0.0)
         global_off = float(self.cfg.get("global_system_offset_ms", 0.0))
         calib_total = per_sound + global_off
-        self.log(f"  Using calibration: per-sound {per_sound:.3f} ms + global {global_off:.3f} ms = total {calib_total:.3f} ms")
+        self.log(f"  using calib: per-sound {per_sound:.2f} + global {global_off:.2f} = {calib_total:.2f} ms")
 
         results = []
         first_good = None
         for i in range(repeats):
-            self._gen_signal(core, preset)
-            d_raw, rec, ref = self.run_single_measurement(core, preset)
+            self._gen(core, preset)
+            d_raw, rec, ref = self.run_once(core, preset)
             if d_raw is None:
-                self.log(f"  ✗ Run {i+1}/{repeats}: failed")
-                results.append((None, None, None))
+                self.log(f"  ✗ {i+1}/{repeats}: failed")
+                results.append(None)
             else:
                 d_cal = d_raw - calib_total
-                self.log(f"  ✓ Run {i+1}/{repeats}: raw {d_raw:.3f} ms -> calibrated {d_cal:.3f} ms")
-                results.append((d_cal, rec, ref))
+                self.log(f"  ✓ {i+1}/{repeats}: raw {d_raw:.2f} -> cal {d_cal:.2f} ms")
+                results.append(d_cal)
                 if first_good is None and rec is not None and ref is not None:
                     first_good = (rec, ref)
-            time.sleep(0.2)
+            time.sleep(0.15)
 
-        delays = [r[0] for r in results if r[0] is not None]
-        avg = safe_mean(delays); std = safe_std(delays)
+        avg, std = safe_mean(results), safe_std(results)
         if avg is not None:
-            self.log(f"  -> average (calibrated): {avg:.3f} ms (std {std:.3f} ms)")
+            self.log(f"  -> avg {avg:.2f} ± {std:.2f} ms")
+        else:
+            self.log("  -> no successful runs")
 
         if save_plot_dir and first_good is not None and avg is not None:
             rec, ref = first_good
             try:
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                fname = f"{preset['key']}_plot_{ts}.png"
-                out_path = os.path.join(save_plot_dir, fname)
-                DelayRunner._save_single_plot(rec, ref, avg, core.sample_rate, out_path, title=f"{preset['name']} (avg {avg:.2f} ms)")
-                self.log(f"  Saved plot: {out_path}")
+                out_path = os.path.join(save_plot_dir, f"{preset['key']}_plot_{ts}.png")
+                self._save_plot(rec, ref, avg, core.sample_rate, out_path, f"{preset['name']} (avg {avg:.1f} ms)")
+                self.log(f"  saved plot: {out_path}")
             except Exception as e:
-                self.log(f"  (plot save failed: {e})")
-
+                self.log(f"  (plot failed: {e})")
         return results
 
     @staticmethod
-    def _save_single_plot(recorded_audio, test_signal, avg_delay_ms, sample_rate, filepath, title="Analysis"):
-        plt.figure(figsize=(12, 8))
+    def _save_plot(recorded_audio, test_signal, avg_delay_ms, sample_rate, filepath, title):
+        plt.figure(figsize=(11, 7))
         plt.suptitle(title, fontsize=14)
 
         plt.subplot(3, 1, 1)
         t_ref = np.linspace(0, len(test_signal) / sample_rate, len(test_signal), endpoint=False)
         plt.plot(t_ref * 1000.0, test_signal)
-        plt.title('Reference'); plt.xlabel('Time (ms)'); plt.ylabel('Amplitude')
+        plt.title('Reference')
+        plt.xlabel('Time (ms)'); plt.ylabel('Amplitude')
 
         plt.subplot(3, 1, 2)
         t_rec = np.linspace(0, len(recorded_audio) / sample_rate, len(recorded_audio), endpoint=False)
         plt.plot(t_rec * 1000.0, recorded_audio)
-        plt.title('Recorded'); plt.xlabel('Time (ms)'); plt.ylabel('Amplitude')
+        plt.title('Recorded')
+        plt.xlabel('Time (ms)'); plt.ylabel('Amplitude')
 
         plt.subplot(3, 1, 3)
         correlation = signal.correlate(recorded_audio, test_signal, mode='full')
         lags = np.arange(-len(test_signal) + 1, len(recorded_audio))
         corr_time = lags / sample_rate * 1000.0
         plt.plot(corr_time, correlation)
-        plt.axvline(x=avg_delay_ms, linestyle='--', label=f'Avg Calibrated Delay: {avg_delay_ms:.2f} ms')
+        plt.axvline(x=avg_delay_ms, linestyle='--', label=f'Avg Calibrated: {avg_delay_ms:.1f} ms')
         plt.legend(); plt.title('Cross-correlation')
         plt.xlabel('Delay (ms)'); plt.ylabel('Correlation')
-
         plt.tight_layout(); plt.savefig(filepath); plt.close()
 
     @staticmethod
-    def save_overall_bar(all_delays_by_preset, filepath):
-        names = []; means = []; stds = []
+    def save_bar(all_delays_by_preset, filepath):
+        names, means, stds = [], [], []
         for name, delays in all_delays_by_preset.items():
             d = [x for x in delays if x is not None]
-            if not d: continue
-            names.append(name); means.append(np.mean(d)); stds.append(np.std(d))
-        if not names: return False
+            if not d: 
+                continue
+            names.append(name)
+            means.append(np.mean(d))
+            stds.append(np.std(d))
+        if not names:
+            return False
         plt.figure(figsize=(10, 5))
         bars = plt.bar(names, means, yerr=stds, capsize=5)
-        for bar in bars:
-            y = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2, y + 1, f"{y:.1f}", ha='center', va='bottom')
-        plt.ylabel("Average Calibrated Delay (ms)")
+        for b in bars:
+            y = b.get_height()
+            plt.text(b.get_x() + b.get_width()/2, y + 1, f"{y:.1f}", ha='center', va='bottom')
+        plt.ylabel("Avg Calibrated Delay (ms)")
         plt.title("Average Calibrated Delay per Sound")
-        plt.xticks(rotation=30, ha='right')
+        plt.xticks(rotation=25, ha='right')
         plt.tight_layout(); plt.savefig(filepath); plt.close()
         return True
 
+    @staticmethod
+    def save_report(all_results, cfg, filepath):
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("="*64 + "\\n")
+            f.write("LATENCY LAB REPORT\\n")
+            f.write("="*64 + "\\n")
+            f.write(f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n")
+            f.write(f"Calibration: GLOBAL {cfg.get('global_system_offset_ms',0.0):.2f} ms + per-sound\\n\\n")
+
+            overall = []
+            for name, data in all_results.items():
+                f.write(f"\\n--- {name} ---\\n")
+                f.write(f"Per-sound baseline: {data['per_sound_baseline_ms']:.2f} ms\\n")
+                delays = data["delays_ms"]
+                good = [x for x in delays if x is not None]
+                if good:
+                    f.write("Delays (ms): " + ", ".join(f"{x:.2f}" for x in good) + "\\n")
+                    f.write(f"Avg: {np.mean(good):.2f} | Std: {np.std(good):.2f} | N: {len(good)}\\n")
+                    overall.extend(good)
+                else:
+                    f.write("No successful runs.\\n")
+
+            if overall:
+                f.write("\\n=== OVERALL ===\\n")
+                f.write(f"Overall Avg: {np.mean(overall):.2f} | Std: {np.std(overall):.2f} | N: {len(overall)}\\n")
+            f.write("\\nEND\\n")
 
 # -------------------------------
 # Lab Tests
 # -------------------------------
 class LabTests:
-    def __init__(self, core: AudioCore, log_fn):
+    def __init__(self, core, log_fn):
         self.core = core
         self.log = log_fn
-        self.results = []   # list of dicts
+        self.results = []
 
-    # --- Balance (L vs R level) ---
     def test_balance(self, freq=1000.0, tone_dur=1.0, settle=0.2):
         self.log("[BALANCE] Place mic on LEFT earcup, then click OK")
         messagebox.showinfo("Balance", "Place mic on LEFT earcup, then click OK")
@@ -438,7 +463,6 @@ class LabTests:
         self.log(f"[BALANCE] L {levelL:.2f} dBFS, R {levelR:.2f} dBFS, Δ {diff:.2f} dB")
         return res
 
-    # --- Crosstalk (L->R) ---
     def test_crosstalk(self, freq=1000.0, tone_dur=1.0, settle=0.2, direction="LtoR"):
         if direction == "LtoR":
             self.log("[CROSSTALK] Place mic on LEFT earcup (PRIMARY), click OK")
@@ -446,7 +470,7 @@ class LabTests:
             sig = self.core.generate_sine(freq=freq, duration=tone_dur)
             rec_primary = self._play_and_record(sig, left_only=True, settle=settle)
 
-            self.log("[CROSSTALK] Now move mic to RIGHT earcup (LEAK), click OK")
+            self.log("[CROSSTALK] Move mic to RIGHT earcup (LEAK), click OK")
             messagebox.showinfo("Crosstalk", "Move mic to RIGHT earcup (LEAK), then click OK")
             self.core.generate_sine(freq=freq, duration=tone_dur)
             rec_leak = self._play_and_record(self.core.test_signal, left_only=True, settle=settle)
@@ -456,7 +480,7 @@ class LabTests:
             sig = self.core.generate_sine(freq=freq, duration=tone_dur)
             rec_primary = self._play_and_record(sig, right_only=True, settle=settle)
 
-            self.log("[CROSSTALK] Now move mic to LEFT earcup (LEAK), click OK")
+            self.log("[CROSSTALK] Move mic to LEFT earcup (LEAK), click OK")
             messagebox.showinfo("Crosstalk", "Move mic to LEFT earcup (LEAK), then click OK")
             self.core.generate_sine(freq=freq, duration=tone_dur)
             rec_leak = self._play_and_record(self.core.test_signal, right_only=True, settle=settle)
@@ -473,30 +497,24 @@ class LabTests:
         self.log(f"[CROSSTALK {direction}] {crosstalk_db:.2f} dB (leak vs primary)")
         return res
 
-    # --- Sweep FR (relative) ---
     def test_sweep_fr(self, f0=20, f1=20000, duration=6.0, save_plot_dir=None):
-        self.log("[SWEEP FR] Position mic at reference spot, keep still. Running...")
+        self.log("[SWEEP FR] Keep mic steady near driver. Running...")
         sig, t = self.core.generate_log_chirp(f0=f0, f1=f1, duration=duration, amp=0.5)
         rec = self._play_and_record(sig, both_channels=True, settle=0.05, rec_dur=duration+0.5)
 
-        # align via xcorr
         delay_ms, _ = AudioCore.find_delay_ms(rec, sig, self.core.sample_rate)
         delay_s = 0.0 if delay_ms is None else delay_ms/1000.0
         shift = int(round(delay_s * self.core.sample_rate))
         rec_aligned = rec[shift: shift + len(sig)] if shift >=0 else rec[:len(sig)]
-
-        # envelope via Hilbert
         if len(rec_aligned) < len(sig):
-            pad = len(sig)-len(rec_aligned)
-            rec_aligned = np.pad(rec_aligned, (0,pad))
+            rec_aligned = np.pad(rec_aligned, (0, len(sig)-len(rec_aligned)))
+
         env = np.abs(signal.hilbert(rec_aligned))
         env = env / (np.max(env)+1e-12)
 
-        # map t -> f
         T = duration
         freqs_inst = f0 * (f1/f0) ** (t / T)
 
-        # bin into log-spaced frequency grid
         grid = np.logspace(np.log10(max(20,f0)), np.log10(min(f1,20000)), 200)
         mag = np.zeros_like(grid)
         for i, f in enumerate(grid):
@@ -529,16 +547,15 @@ class LabTests:
 
         return res
 
-    # --- THD ---
     def test_thd(self, tones=(100, 1000, 6000), tone_dur=1.0, amp=0.6):
-        self.log("[THD] Running tones: " + ", ".join(str(x) for x in tones))
+        self.log("[THD] Tones: " + ", ".join(str(x) for x in tones))
         thd_list = []
         for f in tones:
             sig = self.core.generate_sine(freq=f, duration=tone_dur, amp=amp)
             rec = self._play_and_record(sig, both_channels=True, settle=0.05)
             thd = self._compute_thd(rec, f)
             thd_list.append({"freq": f, "thd_percent": thd})
-            self.log(f"  f={f} Hz  THD={thd:.3f}%")
+            self.log(f"  {f} Hz -> THD {thd:.3f}%")
 
         res = {
             "test": "thd",
@@ -549,15 +566,14 @@ class LabTests:
         self.results.append(res)
         return res
 
-    # --- Isolation (inside vs outside) ---
     def test_isolation(self, noise_dur=2.0, amp=0.4):
-        self.log("[ISOLATION] Place mic near earcup seal (inside). Click OK to measure.")
-        messagebox.showinfo("Isolation", "Place mic near earcup seal (inside). Click OK to measure.")
+        self.log("[ISOLATION] Place mic near earcup (inside). Click OK.")
+        messagebox.showinfo("Isolation", "Place mic near earcup seal (inside). Click OK.")
         sig = self.core.generate_pink_noise(duration=noise_dur, amp=amp)
         rec_in = self._play_and_record(sig, both_channels=True, settle=0.05)
 
-        self.log("[ISOLATION] Move mic ~5–10 cm outside the cup. Click OK to measure.")
-        messagebox.showinfo("Isolation", "Move mic ~5–10 cm outside the cup. Click OK to measure.")
+        self.log("[ISOLATION] Move mic 5–10 cm outside the cup. Click OK.")
+        messagebox.showinfo("Isolation", "Move mic ~5–10 cm outside the cup. Click OK.")
         self.core.generate_pink_noise(duration=noise_dur, amp=amp)
         rec_out = self._play_and_record(self.core.test_signal, both_channels=True, settle=0.05)
 
@@ -573,7 +589,7 @@ class LabTests:
         self.log(f"[ISOLATION] Inside {in_db:.2f} dBFS, Outside {out_db:.2f} dBFS, Δ {delta:.2f} dB")
         return res
 
-    # --- Helpers ---
+    # helpers
     def _play_and_record(self, mono_signal, left_only=False, right_only=False, both_channels=False, settle=0.05, rec_dur=None):
         if rec_dur is None:
             rec_dur = float(self.core.duration) + 0.3
@@ -587,7 +603,7 @@ class LabTests:
             self.core.play_stereo(mono_signal, np.zeros_like(mono_signal))
         elif right_only:
             self.core.play_stereo(np.zeros_like(mono_signal), mono_signal)
-        else:  # both or mono path
+        else:
             if both_channels:
                 self.core.play_stereo(mono_signal, mono_signal)
             else:
@@ -601,7 +617,6 @@ class LabTests:
         win = signal.windows.hann(len(x), sym=False)
         X = np.fft.rfft(x*win, n=N)
         freqs = np.fft.rfftfreq(N, 1/sr)
-        # fundamental bin
         def bin_mag(f):
             k = np.argmin(np.abs(freqs - f))
             return np.abs(X[k])
@@ -617,7 +632,6 @@ class LabTests:
     def _now(self):
         return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # --- Export ---
     def export_last(self, out_dir):
         if not self.results:
             raise RuntimeError("No lab test results yet.")
@@ -625,10 +639,8 @@ class LabTests:
         last = self.results[-1]
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         base = os.path.join(out_dir, f"lab_{last['test']}_{ts}")
-        # JSON
         with open(base + ".json", "w", encoding="utf-8") as f:
             json.dump(last, f, indent=2, ensure_ascii=False)
-        # CSV quick dump if numeric list present
         self._maybe_write_csv(last, base + ".csv")
         return base + ".json"
 
@@ -640,7 +652,6 @@ class LabTests:
         base = os.path.join(out_dir, f"lab_ALL_{ts}")
         with open(base + ".json", "w", encoding="utf-8") as f:
             json.dump(self.results, f, indent=2, ensure_ascii=False)
-        # Also write a CSV summary
         csv_path = base + ".csv"
         with open(csv_path, "w", encoding="utf-8") as f:
             f.write("test,timestamp,key,value\n")
@@ -666,17 +677,20 @@ class LabTests:
         except Exception:
             pass
 
-
 # -------------------------------
-# GUI
+# UI
 # -------------------------------
-class App(tk.Tk):
+class SleekApp(ctk.CTk):
     def __init__(self):
+        self.cfg = load_config()
+        # Apply UI theme
+        ctk.set_appearance_mode(self.cfg["ui"].get("appearance_mode", "Dark"))
+        ctk.set_default_color_theme(self.cfg["ui"].get("color_theme", "blue"))
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1080x760")
+        self.geometry("1180x780")
+        self.minsize(1024, 700)
 
-        self.cfg = load_config()
         self.core = AudioCore(
             sample_rate=self.cfg["last_settings"]["sample_rate"],
             chunk_size=1024,
@@ -684,449 +698,631 @@ class App(tk.Tk):
             output_device_index=self.cfg["last_settings"]["output_device_index"],
             input_device_index=self.cfg["last_settings"]["input_device_index"],
         )
-        self.runner = DelayRunner(self.cfg, self.log)
-        self.lab = LabTests(self.core, self.log)
+        self.runner = DelayRunner(self.cfg, self._log)
+        self.lab = LabTests(self.core, self._log)
 
-        self._build_ui()
-        self._refresh_device_lists()
+        self._build_layout()
+        self._refresh_devices()
 
-        self.worker_thread = None
-        self.stop_flag = False
+        self.worker = None
+        self._busy(False)
 
-    def _build_ui(self):
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True)
+    def _build_layout(self):
+        # Sidebar
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-        self.page_test = ttk.Frame(nb)
-        self.page_cal = ttk.Frame(nb)
-        self.page_settings = ttk.Frame(nb)
-        self.page_lab = ttk.Frame(nb)
-        self.page_export = ttk.Frame(nb)
+        self.sidebar = ctk.CTkFrame(self, corner_radius=0, width=240)
+        self.sidebar.grid(row=0, column=0, sticky="nsw")
+        self.sidebar.grid_rowconfigure(15, weight=1)
 
-        nb.add(self.page_test, text="Tests")
-        nb.add(self.page_cal, text="Calibration")
-        nb.add(self.page_lab, text="Lab Tests")
-        nb.add(self.page_settings, text="Settings / Devices")
-        nb.add(self.page_export, text="Export")
+        self.logo = ctk.CTkLabel(self.sidebar, text="Latency Lab", font=ctk.CTkFont(size=20, weight="bold"))
+        self.logo.grid(row=0, column=0, padx=18, pady=(18, 8), sticky="w")
 
-        self._build_test_tab()
-        self._build_cal_tab()
-        self._build_lab_tab()
-        self._build_settings_tab()
-        self._build_export_tab()
+        self.status_chip = ctk.CTkLabel(self.sidebar, text="IDLE", fg_color="#2d3748", corner_radius=6, padx=8, pady=4)
+        self.status_chip.grid(row=1, column=0, padx=18, pady=(0, 12), sticky="w")
 
-        frm_log = ttk.Frame(self)
-        frm_log.pack(fill="both", side="bottom")
-        ttk.Label(frm_log, text="Log").pack(anchor="w")
-        self.txt_log = tk.Text(frm_log, height=12)
-        self.txt_log.pack(fill="both", expand=True)
+        # Nav
+        btn = lambda text, key: ctk.CTkButton(self.sidebar, text=text, command=lambda: self._show_page(key))
+        self.btn_measure = btn("Measure", "measure")
+        self.btn_calib = btn("Calibrate", "calib")
+        self.btn_lab = btn("Lab Tests", "lab")
+        self.btn_devices = btn("Devices / Settings", "devices")
+        self.btn_results = btn("Results / Export", "results")
 
-    # --- Original Tests Tab ---
-    def _build_test_tab(self):
-        frm = self.page_test
+        self.btn_measure.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
+        self.btn_calib.grid(row=3, column=0, padx=16, pady=6, sticky="ew")
+        self.btn_lab.grid(row=4, column=0, padx=16, pady=6, sticky="ew")
+        self.btn_devices.grid(row=5, column=0, padx=16, pady=6, sticky="ew")
+        self.btn_results.grid(row=6, column=0, padx=16, pady=6, sticky="ew")
 
-        top = ttk.Frame(frm)
-        top.pack(fill="x", pady=6)
+        # Theme controls
+        ctk.CTkLabel(self.sidebar, text="Appearance").grid(row=8, column=0, padx=18, pady=(16, 4), sticky="w")
+        self.appearance_menu = ctk.CTkOptionMenu(
+            self.sidebar, values=["Light", "Dark", "System"],
+            command=self._on_change_appearance
+        )
+        self.appearance_menu.set(self.cfg["ui"].get("appearance_mode", "Dark"))
+        self.appearance_menu.grid(row=9, column=0, padx=18, sticky="ew")
 
-        self.var_repeats = tk.IntVar(value=self.cfg["last_settings"]["repeats"])
-        ttk.Label(top, text="Repeats").pack(side="left", padx=(0,6))
-        ttk.Spinbox(top, from_=1, to=20, textvariable=self.var_repeats, width=5).pack(side="left")
+        ctk.CTkLabel(self.sidebar, text="Accent Color").grid(row=10, column=0, padx=18, pady=(12, 4), sticky="w")
+        self.color_menu = ctk.CTkOptionMenu(
+            self.sidebar, values=["blue", "dark-blue", "green"],
+            command=self._on_change_color_theme
+        )
+        self.color_menu.set(self.cfg["ui"].get("color_theme", "blue"))
+        self.color_menu.grid(row=11, column=0, padx=18, sticky="ew")
 
-        ttk.Button(top, text="Run Selected", command=self.on_run_selected).pack(side="left", padx=6)
-        ttk.Button(top, text="Run ALL", command=self.on_run_all).pack(side="left", padx=6)
+        self.progress = ctk.CTkProgressBar(self.sidebar, mode="indeterminate")
+        self.progress.grid(row=12, column=0, padx=16, pady=12, sticky="ew")
 
-        self.var_save_plots = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="Save per-sound example plot", variable=self.var_save_plots).pack(side="left", padx=12)
+        # Main area
+        self.main = ctk.CTkFrame(self, corner_radius=0)
+        self.main.grid(row=0, column=1, sticky="nsew")
+        self.main.grid_rowconfigure(1, weight=1)
+        self.main.grid_columnconfigure(0, weight=1)
 
-        self.var_save_overall = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="Save overall bar chart", variable=self.var_save_overall).pack(side="left", padx=12)
+        # Pages
+        self.pages = {}
+        self.pages["measure"] = self._build_measure_page(self.main)
+        self.pages["calib"] = self._build_calib_page(self.main)
+        self.pages["lab"] = self._build_lab_page(self.main)
+        self.pages["devices"] = self._build_devices_page(self.main)
+        self.pages["results"] = self._build_results_page(self.main)
+        self._show_page("measure")
 
-        self.var_outdir = tk.StringVar(value=os.getcwd())
-        ttk.Button(top, text="Choose Output Folder", command=self._choose_outdir).pack(side="right")
-        ttk.Entry(top, textvariable=self.var_outdir, width=40).pack(side="right", padx=6)
+    # ---------- Pages
+    def _kpi_card(self, parent, title, value, col):
+        frame = ctk.CTkFrame(parent, corner_radius=10)
+        frame.grid(row=0, column=col, padx=6, sticky="ew")
+        ctk.CTkLabel(frame, text=title, font=ctk.CTkFont(size=13)).pack(anchor="w", padx=12, pady=(10,0))
+        val = ctk.CTkLabel(frame, text=value, font=ctk.CTkFont(size=24, weight="bold"))
+        val.pack(anchor="w", padx=12, pady=(4,12))
+        return val
 
-        mid = ttk.Frame(frm)
-        mid.pack(fill="both", expand=True, pady=6)
+    def _build_measure_page(self, parent):
+        page = ctk.CTkFrame(parent)
+        page.grid(row=0, column=0, sticky="nsew")
+        page.grid_columnconfigure(1, weight=1)
+        page.grid_rowconfigure(2, weight=1)
 
-        self.lst_presets = tk.Listbox(mid, selectmode="extended", height=8)
-        for p in SOUND_PRESETS:
-            self.lst_presets.insert(tk.END, p["name"])
-        self.lst_presets.grid(row=0, column=0, sticky="nsew", padx=(0,6))
-        mid.grid_columnconfigure(0, weight=0)
-        mid.grid_columnconfigure(1, weight=1)
-        mid.grid_rowconfigure(0, weight=1)
+        header = ctk.CTkLabel(page, text="Measure", font=ctk.CTkFont(size=18, weight="bold"))
+        header.grid(row=0, column=0, columnspan=2, padx=18, pady=(18, 4), sticky="w")
 
-        self.txt_summary = tk.Text(mid)
-        self.txt_summary.grid(row=0, column=1, sticky="nsew")
+        left = ctk.CTkFrame(page)
+        left.grid(row=1, column=0, rowspan=2, padx=18, pady=12, sticky="nsw")
 
-        bottom = ttk.Frame(frm)
-        bottom.pack(fill="x", pady=6)
-        ttk.Button(bottom, text="Save Text Report", command=self.on_save_report).pack(side="left")
+        self.preset_vars = {}
+        for i, p in enumerate(SOUND_PRESETS):
+            var = ctk.BooleanVar(value=(p["key"] != "impulse"))
+            self.preset_vars[p["key"]] = var
+            ctk.CTkSwitch(left, text=p["name"], variable=var).grid(row=i, column=0, padx=12, pady=6, sticky="w")
 
-    # --- Calibration Tab ---
-    def _build_cal_tab(self):
-        frm = self.page_cal
+        ctk.CTkLabel(left, text="Repeats").grid(row=len(SOUND_PRESETS), column=0, padx=12, pady=(12, 0), sticky="w")
+        self.repeats_var = ctk.IntVar(value=self.cfg["last_settings"]["repeats"])
+        self.repeats_slider = ctk.CTkSlider(left, from_=1, to=20, number_of_steps=19, command=lambda v: self.repeats_label.configure(text=str(int(v))))
+        self.repeats_slider.set(self.repeats_var.get())
+        self.repeats_slider.grid(row=len(SOUND_PRESETS)+1, column=0, padx=12, pady=(2, 4), sticky="ew")
+        self.repeats_label = ctk.CTkLabel(left, text=str(self.repeats_var.get()))
+        self.repeats_label.grid(row=len(SOUND_PRESETS)+2, column=0, padx=12, pady=(0, 12), sticky="w")
 
-        info = ttk.Frame(frm)
-        info.pack(fill="x", pady=6)
-        ttk.Label(info, text="Per-sound calibration saves a baseline for each preset.\nGlobal system offset (impulse) is recommended with a direct loopback cable."
-                 ).pack(anchor="w")
+        self.save_plots_var = ctk.BooleanVar(value=True)
+        self.save_bar_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(left, text="Save per-sound plot", variable=self.save_plots_var).grid(row=len(SOUND_PRESETS)+3, column=0, padx=12, pady=4, sticky="w")
+        ctk.CTkSwitch(left, text="Save overall bar chart", variable=self.save_bar_var).grid(row=len(SOUND_PRESETS)+4, column=0, padx=12, pady=4, sticky="w")
 
-        row1 = ttk.Frame(frm)
-        row1.pack(fill="x", pady=6)
-        ttk.Button(row1, text="Calibrate Selected Preset", command=self.on_calibrate_selected).pack(side="left", padx=(0,6))
-        ttk.Button(row1, text="Calibrate ALL Presets", command=self.on_calibrate_all).pack(side="left", padx=6)
+        ctk.CTkLabel(left, text="Output Folder").grid(row=len(SOUND_PRESETS)+5, column=0, padx=12, pady=(12, 4), sticky="w")
+        self.output_dir_var = ctk.StringVar(value=self.cfg["last_settings"].get("output_dir", os.getcwd()))
+        out_row = ctk.CTkFrame(left)
+        out_row.grid(row=len(SOUND_PRESETS)+6, column=0, padx=12, pady=(0, 8), sticky="ew")
+        out_row.grid_columnconfigure(0, weight=1)
+        self.output_entry = ctk.CTkEntry(out_row, textvariable=self.output_dir_var)
+        self.output_entry.grid(row=0, column=0, sticky="ew", padx=(0,8))
+        ctk.CTkButton(out_row, text="Browse", command=self._choose_outdir, width=80).grid(row=0, column=1)
 
-        self.var_cal_repeats = tk.IntVar(value=5)
-        ttk.Label(row1, text="Repeats").pack(side="left", padx=(12,6))
-        ttk.Spinbox(row1, from_=1, to=20, textvariable=self.var_cal_repeats, width=5).pack(side="left")
+        btn_row = ctk.CTkFrame(left)
+        btn_row.grid(row=len(SOUND_PRESETS)+7, column=0, padx=12, pady=8, sticky="ew")
+        ctk.CTkButton(btn_row, text="Run Selected", command=self._on_run_selected).grid(row=0, column=0, padx=(0,6))
+        ctk.CTkButton(btn_row, text="Run ALL", command=self._on_run_all).grid(row=0, column=1, padx=6)
 
-        row2 = ttk.Frame(frm)
-        row2.pack(fill="x", pady=6)
-        ttk.Button(row2, text="Calibrate GLOBAL System Offset (Impulse)", command=self.on_calibrate_global).pack(side="left", padx=(0,6))
-        self.lbl_global = ttk.Label(row2, text=f"Current GLOBAL offset: {self.cfg.get('global_system_offset_ms',0.0):.3f} ms")
-        self.lbl_global.pack(side="left", padx=12)
+        right = ctk.CTkFrame(page)
+        right.grid(row=1, column=1, padx=18, pady=12, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(1, weight=1)
 
-    # --- Lab Tests Tab ---
-    def _build_lab_tab(self):
-        frm = self.page_lab
-        frm.grid_columnconfigure(0, weight=1)
-        frm.grid_columnconfigure(1, weight=1)
+        cards = ctk.CTkFrame(right)
+        cards.grid(row=0, column=0, sticky="ew", pady=(0,12))
+        for i in range(3):
+            cards.grid_columnconfigure(i, weight=1)
+        self.kpi_avg = self._kpi_card(cards, "Average (ms)", "--", 0)
+        self.kpi_std = self._kpi_card(cards, "Std Dev (ms)", "--", 1)
+        self.kpi_last = self._kpi_card(cards, "Last (ms)", "--", 2)
+
+        self.summary_box = ctk.CTkTextbox(right, wrap="word")
+        self.summary_box.grid(row=1, column=0, sticky="nsew")
+        self.summary_box.insert("1.0", "Ready.\\n")
+
+        ctk.CTkButton(right, text="Save Text Report", command=self._on_save_report).grid(row=2, column=0, sticky="e", pady=8)
+
+        return page
+
+    def _build_calib_page(self, parent):
+        page = ctk.CTkFrame(parent)
+        page.grid(row=0, column=0, sticky="nsew")
+        page.grid_columnconfigure(1, weight=1)
+        page.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkLabel(page, text="Calibrate", font=ctk.CTkFont(size=18, weight="bold"))
+        header.grid(row=0, column=0, columnspan=2, padx=18, pady=(18, 4), sticky="w")
+
+        left = ctk.CTkFrame(page)
+        left.grid(row=1, column=0, padx=18, pady=12, sticky="nsw")
+
+        self.cal_vars = {}
+        for i, p in enumerate(SOUND_PRESETS):
+            var = ctk.BooleanVar(value=True)
+            self.cal_vars[p["key"]] = var
+            ctk.CTkSwitch(left, text=p["name"], variable=var).grid(row=i, column=0, padx=12, pady=6, sticky="w")
+
+        ctk.CTkLabel(left, text="Repeats").grid(row=len(SOUND_PRESETS), column=0, padx=12, pady=(12, 0), sticky="w")
+        self.cal_repeats_var = ctk.IntVar(value=5)
+        slider = ctk.CTkSlider(left, from_=1, to=20, number_of_steps=19, command=lambda v: reps_lab.configure(text=str(int(v))))
+        slider.set(self.cal_repeats_var.get())
+        slider.grid(row=len(SOUND_PRESETS)+1, column=0, padx=12, pady=(2, 4), sticky="ew")
+        reps_lab = ctk.CTkLabel(left, text=str(self.cal_repeats_var.get()))
+        reps_lab.grid(row=len(SOUND_PRESETS)+2, column=0, padx=12, pady=(0, 12), sticky="w")
+
+        ctk.CTkButton(left, text="Calibrate Selected Presets", command=self._on_cal_selected).grid(row=len(SOUND_PRESETS)+3, column=0, padx=12, pady=(6,4), sticky="ew")
+        ctk.CTkButton(left, text="Calibrate ALL Presets", command=self._on_cal_all).grid(row=len(SOUND_PRESETS)+4, column=0, padx=12, pady=4, sticky="ew")
+        ctk.CTkButton(left, text="Calibrate GLOBAL (Impulse)", command=self._on_cal_global).grid(row=len(SOUND_PRESETS)+5, column=0, padx=12, pady=(4,12), sticky="ew")
+
+        right = ctk.CTkFrame(page)
+        right.grid(row=1, column=1, padx=18, pady=12, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(0, weight=1)
+
+        self.baseline_box = ctk.CTkTextbox(right, wrap="word")
+        self.baseline_box.grid(row=0, column=0, sticky="nsew")
+        self._refresh_baseline_box()
+
+        return page
+
+    def _build_lab_page(self, parent):
+        page = ctk.CTkFrame(parent)
+        page.grid(row=0, column=0, sticky="nsew")
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_columnconfigure(1, weight=1)
+        page.grid_rowconfigure(2, weight=1)
+
+        header = ctk.CTkLabel(page, text="Lab Tests", font=ctk.CTkFont(size=18, weight="bold"))
+        header.grid(row=0, column=0, columnspan=2, padx=18, pady=(18, 4), sticky="w")
 
         # Balance
-        grp_bal = ttk.LabelFrame(frm, text="Channel Balance", padding=8)
-        grp_bal.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        ttk.Label(grp_bal, text="1 kHz default; prompts will guide mic placement.").grid(row=0, column=0, sticky="w")
-        self.var_bal_freq = tk.DoubleVar(value=1000.0)
-        ttk.Label(grp_bal, text="Freq (Hz)").grid(row=1, column=0, sticky="w")
-        ttk.Entry(grp_bal, textvariable=self.var_bal_freq, width=10).grid(row=1, column=1, sticky="w")
-        ttk.Button(grp_bal, text="Run", command=self.on_lab_balance).grid(row=2, column=0, pady=6, sticky="w")
+        bal = ctk.CTkFrame(page)
+        bal.grid(row=1, column=0, padx=18, pady=12, sticky="nsew")
+        ctk.CTkLabel(bal, text="Channel Balance").grid(row=0, column=0, sticky="w", padx=8, pady=(8,4))
+        self.var_bal_freq = ctk.StringVar(value="1000")
+        ctk.CTkLabel(bal, text="Freq (Hz)").grid(row=1, column=0, sticky="w", padx=8)
+        ctk.CTkEntry(bal, textvariable=self.var_bal_freq, width=90).grid(row=1, column=1, sticky="w", padx=8)
+        ctk.CTkButton(bal, text="Run", command=self._on_lab_balance).grid(row=2, column=0, padx=8, pady=8, sticky="w")
 
         # Crosstalk
-        grp_xt = ttk.LabelFrame(frm, text="Crosstalk", padding=8)
-        grp_xt.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
-        ttk.Label(grp_xt, text="Measures leak in dB (L→R or R→L).").grid(row=0, column=0, columnspan=2, sticky="w")
-        self.var_xt_freq = tk.DoubleVar(value=1000.0)
-        ttk.Label(grp_xt, text="Freq (Hz)").grid(row=1, column=0, sticky="w")
-        ttk.Entry(grp_xt, textvariable=self.var_xt_freq, width=10).grid(row=1, column=1, sticky="w")
-        self.var_xt_dir = tk.StringVar(value="LtoR")
-        ttk.Radiobutton(grp_xt, text="L→R", variable=self.var_xt_dir, value="LtoR").grid(row=2, column=0, sticky="w")
-        ttk.Radiobutton(grp_xt, text="R→L", variable=self.var_xt_dir, value="RtoL").grid(row=2, column=1, sticky="w")
-        ttk.Button(grp_xt, text="Run", command=self.on_lab_crosstalk).grid(row=3, column=0, pady=6, sticky="w")
+        xt = ctk.CTkFrame(page)
+        xt.grid(row=1, column=1, padx=18, pady=12, sticky="nsew")
+        ctk.CTkLabel(xt, text="Crosstalk").grid(row=0, column=0, sticky="w", padx=8, pady=(8,4))
+        self.var_xt_freq = ctk.StringVar(value="1000")
+        ctk.CTkLabel(xt, text="Freq (Hz)").grid(row=1, column=0, sticky="w", padx=8)
+        ctk.CTkEntry(xt, textvariable=self.var_xt_freq, width=90).grid(row=1, column=1, sticky="w", padx=8)
+        self.var_xt_dir = ctk.StringVar(value="LtoR")
+        ctk.CTkOptionMenu(xt, values=["LtoR", "RtoL"], variable=self.var_xt_dir).grid(row=1, column=2, padx=8)
+        ctk.CTkButton(xt, text="Run", command=self._on_lab_crosstalk).grid(row=2, column=0, padx=8, pady=8, sticky="w")
 
         # Sweep FR
-        grp_fr = ttk.LabelFrame(frm, text="Sweep FR (relative)", padding=8)
-        grp_fr.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
-        ttk.Label(grp_fr, text="20–20k logarithmic sweep; saves plot if output folder set.").grid(row=0, column=0, sticky="w")
-        self.var_fr_dur = tk.DoubleVar(value=6.0)
-        ttk.Label(grp_fr, text="Duration (s)").grid(row=1, column=0, sticky="w")
-        ttk.Entry(grp_fr, textvariable=self.var_fr_dur, width=10).grid(row=1, column=1, sticky="w")
-        ttk.Button(grp_fr, text="Run", command=self.on_lab_sweep).grid(row=2, column=0, pady=6, sticky="w")
+        fr = ctk.CTkFrame(page)
+        fr.grid(row=2, column=0, padx=18, pady=12, sticky="nsew")
+        ctk.CTkLabel(fr, text="Sweep FR (relative)").grid(row=0, column=0, sticky="w", padx=8, pady=(8,4))
+        self.var_fr_dur = ctk.StringVar(value="6.0")
+        ctk.CTkLabel(fr, text="Duration (s)").grid(row=1, column=0, sticky="w", padx=8)
+        ctk.CTkEntry(fr, textvariable=self.var_fr_dur, width=90).grid(row=1, column=1, sticky="w", padx=8)
+        ctk.CTkButton(fr, text="Run", command=self._on_lab_sweep).grid(row=2, column=0, padx=8, pady=8, sticky="w")
 
         # THD
-        grp_thd = ttk.LabelFrame(frm, text="THD", padding=8)
-        grp_thd.grid(row=1, column=1, sticky="nsew", padx=8, pady=8)
-        ttk.Label(grp_thd, text="Measures THD at 100 / 1k / 6k Hz.").grid(row=0, column=0, sticky="w")
-        ttk.Button(grp_thd, text="Run", command=self.on_lab_thd).grid(row=1, column=0, pady=6, sticky="w")
+        thd = ctk.CTkFrame(page)
+        thd.grid(row=2, column=1, padx=18, pady=12, sticky="nsew")
+        ctk.CTkLabel(thd, text="THD (100/1k/6k Hz)").grid(row=0, column=0, sticky="w", padx=8, pady=(8,4))
+        ctk.CTkButton(thd, text="Run", command=self._on_lab_thd).grid(row=1, column=0, padx=8, pady=8, sticky="w")
 
         # Isolation
-        grp_iso = ttk.LabelFrame(frm, text="Isolation (Inside→Outside)", padding=8)
-        grp_iso.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
-        ttk.Label(grp_iso, text="Plays pink noise; measure inside pad then outside ~10 cm.").grid(row=0, column=0, sticky="w")
-        ttk.Button(grp_iso, text="Run", command=self.on_lab_isolation).grid(row=1, column=0, pady=6, sticky="w")
+        iso = ctk.CTkFrame(page)
+        iso.grid(row=3, column=0, padx=18, pady=12, sticky="nsew")
+        ctk.CTkLabel(iso, text="Isolation (Inside → Outside)").grid(row=0, column=0, sticky="w", padx=8, pady=(8,4))
+        ctk.CTkButton(iso, text="Run", command=self._on_lab_isolation).grid(row=1, column=0, padx=8, pady=8, sticky="w")
 
-        # Lab Results box + export
-        grp_res = ttk.LabelFrame(frm, text="Lab Results", padding=8)
-        grp_res.grid(row=2, column=1, sticky="nsew", padx=8, pady=8)
-        self.txt_lab = tk.Text(grp_res, height=18)
-        self.txt_lab.pack(fill="both", expand=True)
-        btns = ttk.Frame(grp_res); btns.pack(fill="x", pady=6)
-        ttk.Button(btns, text="Export LAST (JSON/CSV)", command=self.on_lab_export_last).pack(side="left", padx=4)
-        ttk.Button(btns, text="Export ALL (JSON/CSV)", command=self.on_lab_export_all).pack(side="left", padx=4)
+        # Results + export
+        labres = ctk.CTkFrame(page)
+        labres.grid(row=3, column=1, padx=18, pady=12, sticky="nsew")
+        labres.grid_rowconfigure(0, weight=1)
+        labres.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(labres, text="Lab Results").grid(row=0, column=0, sticky="w", padx=8, pady=(8,4))
+        self.txt_lab = ctk.CTkTextbox(labres)
+        self.txt_lab.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
+        row = ctk.CTkFrame(labres); row.grid(row=2, column=0, sticky="ew", padx=8, pady=(0,8))
+        ctk.CTkButton(row, text="Export LAST (JSON/CSV)", command=self._on_lab_export_last).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="Export ALL (JSON/CSV)", command=self._on_lab_export_all).pack(side="left", padx=4)
 
-    # --- Settings Tab ---
-    def _build_settings_tab(self):
-        frm = self.page_settings
+        return page
 
-        af = ttk.LabelFrame(frm, text="Audio Parameters")
-        af.pack(fill="x", padx=6, pady=6)
-        self.var_sr = tk.IntVar(value=self.cfg["last_settings"]["sample_rate"])
-        self.var_dur = tk.DoubleVar(value=self.cfg["last_settings"]["duration"])
+    def _build_devices_page(self, parent):
+        page = ctk.CTkFrame(parent)
+        page.grid(row=0, column=0, sticky="nsew")
+        page.grid_columnconfigure(1, weight=1)
 
-        ttk.Label(af, text="Sample Rate").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        ttk.Spinbox(af, from_=16000, to=192000, increment=1000, textvariable=self.var_sr, width=8).grid(row=0, column=1, padx=6)
+        header = ctk.CTkLabel(page, text="Devices / Settings", font=ctk.CTkFont(size=18, weight="bold"))
+        header.grid(row=0, column=0, columnspan=2, padx=18, pady=(18, 4), sticky="w")
 
-        ttk.Label(af, text="Signal Duration (s)").grid(row=1, column=0, sticky="w", padx=6, pady=4)
-        ttk.Spinbox(af, from_=0.05, to=2.0, increment=0.05, textvariable=self.var_dur, width=8).grid(row=1, column=1, padx=6)
+        # Audio parameters
+        card = ctk.CTkFrame(page)
+        card.grid(row=1, column=0, columnspan=2, padx=18, pady=12, sticky="ew")
+        for i in range(6):
+            card.grid_columnconfigure(i, weight=1)
 
-        ttk.Button(af, text="Apply", command=self.on_apply_audio_params).grid(row=0, column=2, rowspan=2, padx=12)
+        ctk.CTkLabel(card, text="Sample Rate").grid(row=0, column=0, padx=8, pady=8, sticky="w")
+        self.sr_var = ctk.IntVar(value=self.cfg["last_settings"]["sample_rate"])
+        ctk.CTkEntry(card, textvariable=self.sr_var, width=110).grid(row=0, column=1, padx=8, pady=8, sticky="w")
 
-        df = ttk.LabelFrame(frm, text="Devices")
-        df.pack(fill="both", expand=True, padx=6, pady=6)
+        ctk.CTkLabel(card, text="Signal Duration (s)").grid(row=0, column=2, padx=8, pady=8, sticky="w")
+        self.dur_var = ctk.DoubleVar(value=self.cfg["last_settings"]["duration"])
+        ctk.CTkEntry(card, textvariable=self.dur_var, width=110).grid(row=0, column=3, padx=8, pady=8, sticky="w")
 
-        ttk.Label(df, text="Output Device").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        ttk.Label(df, text="Input Device").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ctk.CTkButton(card, text="Apply", command=self._on_apply_audio).grid(row=0, column=5, padx=8, pady=8, sticky="e")
 
-        self.cmb_out = ttk.Combobox(df, state="readonly", width=70)
-        self.cmb_in  = ttk.Combobox(df, state="readonly", width=70)
-        self.cmb_out.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
-        self.cmb_in.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+        # Device selectors
+        dev_card = ctk.CTkFrame(page)
+        dev_card.grid(row=2, column=0, columnspan=2, padx=18, pady=8, sticky="ew")
+        dev_card.grid_columnconfigure(1, weight=1)
 
-        ttk.Button(df, text="Refresh Devices", command=self._refresh_device_lists).grid(row=0, column=2, rowspan=2, padx=6)
-        ttk.Button(df, text="Use Selected Devices", command=self.on_use_selected_devices).grid(row=0, column=3, rowspan=2, padx=6)
-        df.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(dev_card, text="Output Device").grid(row=0, column=0, padx=8, pady=(8,4), sticky="w")
+        self.out_menu = ctk.CTkOptionMenu(dev_card, values=["<refresh>"], command=lambda _: None)
+        self.out_menu.grid(row=0, column=1, padx=8, pady=(8,4), sticky="ew")
 
-    # --- Export Tab (legacy tests) ---
-    def _build_export_tab(self):
-        frm = self.page_export
-        ttk.Label(frm, text="Export legacy test results from the Tests tab (summary + plots).").pack(anchor="w", padx=8, pady=(8,2))
-        ttk.Button(frm, text="Save Text Report", command=self.on_save_report).pack(anchor="w", padx=8, pady=4)
+        ctk.CTkLabel(dev_card, text="Input Device").grid(row=1, column=0, padx=8, pady=(4,8), sticky="w")
+        self.in_menu = ctk.CTkOptionMenu(dev_card, values=["<refresh>"], command=lambda _: None)
+        self.in_menu.grid(row=1, column=1, padx=8, pady=(4,8), sticky="ew")
 
-    # --- Actions (Original Tests) ---
-    def on_apply_audio_params(self):
-        self.core.sample_rate = int(self.var_sr.get())
-        self.core.duration = float(self.var_dur.get())
-        self.cfg["last_settings"]["sample_rate"] = self.core.sample_rate
-        self.cfg["last_settings"]["duration"] = self.core.duration
-        save_config(self.cfg)
-        self.log(f"[SET] Applied sample_rate={self.core.sample_rate}, duration={self.core.duration}s")
+        btns = ctk.CTkFrame(page)
+        btns.grid(row=3, column=0, columnspan=2, padx=18, pady=8, sticky="ew")
+        btns.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(btns, text="Refresh Devices", command=self._refresh_devices).grid(row=0, column=0, padx=6, pady=6, sticky="w")
+        ctk.CTkButton(btns, text="Use Selected Devices", command=self._on_use_devices).grid(row=0, column=1, padx=6, pady=6, sticky="e")
 
-    def on_use_selected_devices(self):
-        out_idx = self.cmb_out.current()
-        in_idx = self.cmb_in.current()
-        if out_idx < 0 or in_idx < 0:
-            messagebox.showwarning("Devices", "Please select both output and input devices.")
+        return page
+
+    def _build_results_page(self, parent):
+        page = ctk.CTkFrame(parent)
+        page.grid(row=0, column=0, sticky="nsew")
+        page.grid_rowconfigure(0, weight=1)
+        page.grid_columnconfigure(0, weight=1)
+
+        header = ctk.CTkLabel(page, text="Results & Export", font=ctk.CTkFont(size=18, weight="bold"))
+        header.grid(row=0, column=0, padx=18, pady=(18, 4), sticky="w")
+
+        self.log_box = ctk.CTkTextbox(page, wrap="word")
+        self.log_box.grid(row=1, column=0, sticky="nsew", padx=18, pady=12)
+
+        btns = ctk.CTkFrame(page)
+        btns.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 12))
+        btns.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(btns, text="Copy Log", command=self._copy_log, width=110).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(btns, text="Clear Log", command=lambda: self.log_box.delete("1.0", "end"), width=110).grid(row=0, column=1, padx=6, sticky="w")
+
+        return page
+
+    # ---------- Nav & Theme
+    def _show_page(self, key):
+        for k, p in self.pages.items():
+            p.grid_remove()
+        self.pages[key].grid()
+        self.status_chip.configure(text=key.upper())
+
+    def _on_change_appearance(self, value):
+        try:
+            ctk.set_appearance_mode(value)
+            self.cfg["ui"]["appearance_mode"] = value
+            save_config(self.cfg)
+        except Exception as e:
+            messagebox.showerror("Appearance", str(e))
+
+    def _on_change_color_theme(self, value):
+        try:
+            ctk.set_default_color_theme(value)
+            self.cfg["ui"]["color_theme"] = value
+            save_config(self.cfg)
+        except Exception as e:
+            messagebox.showerror("Color Theme", str(e))
+
+    # ---------- Handlers (Measure/Calib)
+    def _choose_outdir(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.output_dir_var.set(d)
+            self.cfg["last_settings"]["output_dir"] = d
+            save_config(self.cfg)
+
+    def _on_run_selected(self):
+        presets = [p for p in SOUND_PRESETS if self.preset_vars[p["key"]].get()]
+        if not presets:
+            messagebox.showinfo("Measure", "Select at least one preset.")
             return
-        out_dev_idx = self.cmb_out_values[out_idx][0]
-        in_dev_idx = self.cmb_in_values[in_idx][0]
+        self._start(self._run_tests, presets)
 
-        self.core.set_devices(output_index=out_dev_idx, input_index=in_dev_idx)
-        self.cfg["last_settings"]["output_device_index"] = out_dev_idx
-        self.cfg["last_settings"]["input_device_index"] = in_dev_idx
-        save_config(self.cfg)
-        self.log(f"[SET] Using output_device_index={out_dev_idx}, input_device_index={in_dev_idx}")
+    def _on_run_all(self):
+        self._start(self._run_tests, SOUND_PRESETS[:])
 
-    def on_run_selected(self):
-        sel = self.lst_presets.curselection()
-        if not sel:
-            messagebox.showinfo("Run Selected", "Select at least one preset.")
-            return
-        presets = [SOUND_PRESETS[i] for i in sel]
-        self._start_worker(self._do_run_tests, presets)
-
-    def on_run_all(self):
-        self._start_worker(self._do_run_tests, SOUND_PRESETS[:])
-
-    def on_save_report(self):
+    def _on_save_report(self):
         if not hasattr(self, "last_all_results"):
-            messagebox.showinfo("Save Report", "Run tests first.")
+            messagebox.showinfo("Report", "Run tests first.")
             return
-        out_dir = self.var_outdir.get() or os.getcwd()
+        out_dir = self.output_dir_var.get() or os.getcwd()
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         rep_path = os.path.join(out_dir, f"latency_report_{ts}.txt")
-        # Minimal legacy report (summary already shows stats)
-        with open(rep_path, "w", encoding="utf-8") as f:
-            f.write("Latency Test Report\n")
-            f.write(f"Date: {datetime.datetime.now()}\n\n")
-            for name, data in self.last_all_results.items():
-                dd = data["delays_ms"]
-                if dd:
-                    f.write(f"{name}: avg {np.mean(dd):.3f} ms, std {np.std(dd):.3f}, n {len(dd)}\n")
-                else:
-                    f.write(f"{name}: no successful runs\n")
-        messagebox.showinfo("Report", f"Saved report:\n{rep_path}")
-        self.log(f"[SAVE] Report -> {rep_path}")
+        DelayRunner.save_report(self.last_all_results, self.cfg, rep_path)
+        self._log(f"[SAVE] report -> {rep_path}")
+        messagebox.showinfo("Report", f"Saved:\\n{rep_path}")
 
-    def on_calibrate_selected(self):
-        sel = self.lst_presets.curselection()
-        if not sel:
-            messagebox.showinfo("Calibration", "Select at least one preset (left list on Tests tab).")
+    def _on_cal_selected(self):
+        presets = [p for p in SOUND_PRESETS if self.cal_vars[p["key"]].get()]
+        if not presets:
+            messagebox.showinfo("Calibrate", "Select at least one preset.")
             return
-        presets = [SOUND_PRESETS[i] for i in sel]
-        self._start_worker(self._do_calibrate_presets, presets)
+        self._start(self._cal_presets, presets)
 
-    def on_calibrate_all(self):
-        self._start_worker(self._do_calibrate_presets, SOUND_PRESETS[:])
+    def _on_cal_all(self):
+        self._start(self._cal_presets, SOUND_PRESETS[:])
 
-    def on_calibrate_global(self):
-        self._start_worker(self._do_calibrate_global)
+    def _on_cal_global(self):
+        self._start(self._cal_global)
 
-    def _choose_outdir(self):
-        d = filedialog.askdirectory(title="Choose output folder", mustexist=True)
-        if d:
-            self.var_outdir.set(d)
+    def _on_apply_audio(self):
+        try:
+            self.core.sample_rate = int(self.sr_var.get())
+            self.core.duration = float(self.dur_var.get())
+            self.cfg["last_settings"]["sample_rate"] = self.core.sample_rate
+            self.cfg["last_settings"]["duration"] = self.core.duration
+            save_config(self.cfg)
+            self._log(f"[SET] sr={self.core.sample_rate}, dur={self.core.duration}s")
+        except Exception as e:
+            messagebox.showerror("Settings", str(e))
 
-    def _start_worker(self, fn, *args):
-        if self.worker_thread and self.worker_thread.is_alive():
+    def _on_use_devices(self):
+        out_idx = self._out_indices.get(self.out_menu.get())
+        in_idx = self._in_indices.get(self.in_menu.get())
+        if out_idx is None or in_idx is None:
+            messagebox.showwarning("Devices", "Select both output and input devices.")
+            return
+        self.core.set_devices(output_index=out_idx, input_index=in_idx)
+        self.cfg["last_settings"]["output_device_index"] = out_idx
+        self.cfg["last_settings"]["input_device_index"] = in_idx
+        save_config(self.cfg)
+        self._log(f"[SET] output={out_idx}, input={in_idx}")
+
+    # ---------- Handlers (Lab)
+    def _on_lab_balance(self):
+        try:
+            freq = float(self.var_bal_freq.get())
+            res = self.lab.test_balance(freq=freq)
+            self._append_lab(res)
+        except Exception as e:
+            messagebox.showerror("Balance", str(e))
+
+    def _on_lab_crosstalk(self):
+        try:
+            freq = float(self.var_xt_freq.get())
+            direction = self.var_xt_dir.get()
+            res = self.lab.test_crosstalk(freq=freq, direction=direction)
+            self._append_lab(res)
+        except Exception as e:
+            messagebox.showerror("Crosstalk", str(e))
+
+    def _on_lab_sweep(self):
+        try:
+            dur = float(self.var_fr_dur.get())
+            out_dir = self.output_dir_var.get() or os.getcwd()
+            res = self.lab.test_sweep_fr(duration=dur, save_plot_dir=out_dir)
+            self._append_lab(res)
+        except Exception as e:
+            messagebox.showerror("Sweep FR", str(e))
+
+    def _on_lab_thd(self):
+        try:
+            res = self.lab.test_thd()
+            self._append_lab(res)
+        except Exception as e:
+            messagebox.showerror("THD", str(e))
+
+    def _on_lab_isolation(self):
+        try:
+            res = self.lab.test_isolation()
+            self._append_lab(res)
+        except Exception as e:
+            messagebox.showerror("Isolation", str(e))
+
+    def _on_lab_export_last(self):
+        try:
+            out_dir = self.output_dir_var.get() or os.getcwd()
+            path = self.lab.export_last(out_dir)
+            self._log(f"[EXPORT] Last lab result -> {path}")
+            messagebox.showinfo("Export", f"Saved:\\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export", str(e))
+
+    def _on_lab_export_all(self):
+        try:
+            out_dir = self.output_dir_var.get() or os.getcwd()
+            path = self.lab.export_all(out_dir)
+            self._log(f"[EXPORT] All lab results -> {path}")
+            messagebox.showinfo("Export", f"Saved:\\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export", str(e))
+
+    # ---------- Workers
+    def _start(self, fn, *args):
+        if self.worker and self.worker.is_alive():
             messagebox.showwarning("Busy", "Another task is running.")
             return
-        self.worker_thread = threading.Thread(target=self._guarded_run, args=(fn, *args), daemon=True)
-        self.worker_thread.start()
+        self._busy(True)
+        self.worker = threading.Thread(target=self._guard, args=(fn, *args), daemon=True)
+        self.worker.start()
 
-    def _guarded_run(self, fn, *args):
+    def _guard(self, fn, *args):
         try:
             fn(*args)
         except Exception as e:
-            self.log(f"[ERROR] {e}")
+            self._log(f"[ERROR] {e}")
+        finally:
+            self._busy(False)
 
-    def _do_run_tests(self, presets):
-        repeats = int(self.var_repeats.get())
-        out_dir = self.var_outdir.get() or os.getcwd()
+    def _run_tests(self, presets):
+        repeats = int(self.repeats_slider.get())
+        out_dir = self.output_dir_var.get() or os.getcwd()
         os.makedirs(out_dir, exist_ok=True)
 
-        self.txt_summary.delete("1.0", tk.END)
         all_results = {}
         all_delays_bar = {}
+        summary_lines = ["=== SUMMARY (Calibrated) ==="]
+
+        the_last = None
+        overall_vals = []
 
         for p in presets:
-            results = self.runner.run_test_for_preset(
+            results = self.runner.test_preset(
                 self.core, p, repeats=repeats,
-                save_plot_dir=out_dir if self.var_save_plots.get() else None
+                save_plot_dir=out_dir if self.save_plots_var.get() else None
             )
-            delays = [r[0] for r in results if r[0] is not None]
+            delays = [r for r in results if r is not None]
             all_results[p["name"]] = {
                 "per_sound_baseline_ms": self.cfg["per_sound_offsets_ms"].get(p["key"], 0.0),
                 "delays_ms": delays
             }
             all_delays_bar[p["name"]] = delays
 
+            if delays:
+                avg, std = float(np.mean(delays)), float(np.std(delays))
+                summary_lines.append(f"{p['name']}: avg {avg:.2f} ms | std {std:.2f} | n {len(delays)}")
+                overall_vals.extend(delays)
+                the_last = delays[-1]
+
         self.last_all_results = all_results
+        self.summary_box.delete("1.0", "end")
+        self.summary_box.insert("1.0", "\\n".join(summary_lines))
 
-        lines = ["=== SUMMARY (Calibrated) ==="]
-        for name, data in all_results.items():
-            d = data["delays_ms"]
-            if d:
-                lines.append(f"{name}: avg {np.mean(d):.2f} ms | std {np.std(d):.2f} | n {len(d)}")
-            else:
-                lines.append(f"{name}: no successful runs")
-        self.txt_summary.insert("1.0", "\n".join(lines))
+        # KPI
+        if overall_vals:
+            self.kpi_avg.configure(text=f"{np.mean(overall_vals):.1f}")
+            self.kpi_std.configure(text=f"{np.std(overall_vals):.1f}")
+            self.kpi_last.configure(text=f"{the_last:.1f}")
+        else:
+            self.kpi_avg.configure(text="--")
+            self.kpi_std.configure(text="--")
+            self.kpi_last.configure(text="--")
 
-        if self.var_save_overall.get():
+        # Overall bar chart
+        if self.save_bar_var.get():
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             bar_path = os.path.join(out_dir, f"overall_bar_{ts}.png")
-            ok = DelayRunner.save_overall_bar(all_delays_by_preset=all_delays_bar, filepath=bar_path)
+            ok = DelayRunner.save_bar(all_delays_by_preset=all_delays_bar, filepath=bar_path)
             if ok:
-                self.log(f"[SAVE] Overall bar chart -> {bar_path}")
-            else:
-                self.log("[SAVE] Overall bar chart skipped (no data).")
+                self._log(f"[SAVE] bar chart -> {bar_path}")
 
-        self.log("[DONE] Test sequence complete.")
+        self._log("[DONE] tests complete.")
 
-    def _do_calibrate_presets(self, presets):
-        repeats = int(self.var_cal_repeats.get())
+    def _cal_presets(self, presets):
+        reps = int(self.cal_repeats_var.get())
         for p in presets:
-            self.runner.run_calibration_for_preset(self.core, p, repeats=repeats)
-        self.log("[DONE] Per-sound calibration complete.")
+            self.runner.calibrate_preset(self.core, p, repeats=reps)
+        self._refresh_baseline_box()
+        self._log("[DONE] per-sound calibration complete.")
 
-    def _do_calibrate_global(self):
-        repeats = int(self.var_cal_repeats.get())
-        val = self.runner.run_global_system_calibration(self.core, repeats=repeats)
+    def _cal_global(self):
+        reps = int(self.cal_repeats_var.get())
+        val, _ = self.runner.calibrate_global(self.core, repeats=reps)
         if val is not None:
-            self.lbl_global.config(text=f"Current GLOBAL offset: {val:.3f} ms")
-        self.log("[DONE] Global calibration complete.")
+            self._log(f"[CAL] GLOBAL set to {val:.2f} ms")
+        self._refresh_baseline_box()
+        self._log("[DONE] global calibration complete.")
 
-    # --- Lab Actions ---
-    def on_lab_balance(self):
-        try:
-            freq = float(self.var_bal_freq.get())
-            res = self.lab.test_balance(freq=freq)
-            self._append_lab_result(res)
-        except Exception as e:
-            messagebox.showerror("Balance", str(e))
+    # ---------- Helpers
+    def _refresh_baseline_box(self):
+        lines = ["Per-sound baselines (ms):"]
+        for p in SOUND_PRESETS:
+            val = self.cfg["per_sound_offsets_ms"].get(p["key"], 0.0)
+            lines.append(f"• {p['name']}: {val:.2f}")
+        lines.append(f"\\nGLOBAL offset: {self.cfg.get('global_system_offset_ms', 0.0):.2f} ms")
+        if hasattr(self, "baseline_box"):
+            self.baseline_box.delete("1.0", "end")
+            self.baseline_box.insert("1.0", "\\n".join(lines))
 
-    def on_lab_crosstalk(self):
-        try:
-            freq = float(self.var_xt_freq.get())
-            direction = self.var_xt_dir.get()
-            res = self.lab.test_crosstalk(freq=freq, direction=direction)
-            self._append_lab_result(res)
-        except Exception as e:
-            messagebox.showerror("Crosstalk", str(e))
-
-    def on_lab_sweep(self):
-        try:
-            dur = float(self.var_fr_dur.get())
-            out_dir = self.var_outdir.get() or os.getcwd()
-            res = self.lab.test_sweep_fr(duration=dur, save_plot_dir=out_dir)
-            self._append_lab_result(res)
-        except Exception as e:
-            messagebox.showerror("Sweep FR", str(e))
-
-    def on_lab_thd(self):
-        try:
-            res = self.lab.test_thd()
-            self._append_lab_result(res)
-        except Exception as e:
-            messagebox.showerror("THD", str(e))
-
-    def on_lab_isolation(self):
-        try:
-            res = self.lab.test_isolation()
-            self._append_lab_result(res)
-        except Exception as e:
-            messagebox.showerror("Isolation", str(e))
-
-    def on_lab_export_last(self):
-        try:
-            out_dir = self.var_outdir.get() or os.getcwd()
-            path = self.lab.export_last(out_dir)
-            self.log(f"[EXPORT] Last lab result -> {path}")
-            messagebox.showinfo("Export", f"Saved:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Export", str(e))
-
-    def on_lab_export_all(self):
-        try:
-            out_dir = self.var_outdir.get() or os.getcwd()
-            path = self.lab.export_all(out_dir)
-            self.log(f"[EXPORT] All lab results -> {path}")
-            messagebox.showinfo("Export", f"Saved:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Export", str(e))
-
-    def _append_lab_result(self, res: dict):
-        self.txt_lab.insert("end", json.dumps(res, indent=2, ensure_ascii=False) + "\n\n")
-        self.txt_lab.see("end")
-
-    # --- Devices ---
-    def _refresh_device_lists(self):
+    def _refresh_devices(self):
         devs = self.core.list_devices()
-        out_entries = []
-        in_entries = []
+        out_values = []
+        in_values = []
+        self._out_indices = {}
+        self._in_indices = {}
+
         for i, info in enumerate(devs):
-            name = info.get("name","unknown")
+            name = info.get("name", "unknown")
             max_in = int(info.get("maxInputChannels", 0))
             max_out = int(info.get("maxOutputChannels", 0))
             rate = int(info.get("defaultSampleRate", 0))
             label = f"[{i}] {name}  (in:{max_in}, out:{max_out}, rate:{rate})"
             if max_out > 0:
-                out_entries.append((i, label))
+                out_values.append(label)
+                self._out_indices[label] = i
             if max_in > 0:
-                in_entries.append((i, label))
+                in_values.append(label)
+                self._in_indices[label] = i
 
-        self.cmb_out_values = out_entries
-        self.cmb_in_values = in_entries
+        if not out_values: out_values = ["<no output devices>"]
+        if not in_values: in_values = ["<no input devices>"]
 
-        self.cmb_out['values'] = [x[1] for x in out_entries]
-        self.cmb_in['values'] = [x[1] for x in in_entries]
+        self.out_menu.configure(values=out_values)
+        self.in_menu.configure(values=in_values)
 
-        last_out = self.cfg["last_settings"].get("output_device_index")
-        last_in = self.cfg["last_settings"].get("input_device_index")
+        # Preselect last-used
+        def pick(menu, values, target_idx):
+            if target_idx is None or not values:
+                menu.set(values[0])
+                return
+            for v in values:
+                if self._out_indices.get(v, None) == target_idx or self._in_indices.get(v, None) == target_idx:
+                    menu.set(v); return
+            menu.set(values[0])
 
-        if last_out is not None:
-            for idx, (dev_index, _) in enumerate(out_entries):
-                if dev_index == last_out:
-                    self.cmb_out.current(idx); break
-        if last_in is not None:
-            for idx, (dev_index, _) in enumerate(in_entries):
-                if dev_index == last_in:
-                    self.cmb_in.current(idx); break
+        pick(self.out_menu, out_values, self.cfg["last_settings"].get("output_device_index"))
+        pick(self.in_menu, in_values, self.cfg["last_settings"].get("input_device_index"))
 
-    def log(self, msg):
-        self.txt_log.insert(tk.END, msg + "\n")
-        self.txt_log.see(tk.END)
+    def _busy(self, is_busy: bool):
+        if is_busy:
+            self.status_chip.configure(text="WORKING", fg_color="#1f2937")
+            self.progress.start()
+        else:
+            self.status_chip.configure(text="IDLE", fg_color="#2d3748")
+            self.progress.stop()
 
+    def _log(self, msg):
+        if hasattr(self, "log_box"):
+            self.log_box.insert("end", msg + "\\n")
+            self.log_box.see("end")
+
+    def _copy_log(self):
+        text = self.log_box.get("1.0", "end")
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    def _append_lab(self, res: dict):
+        if hasattr(self, "txt_lab"):
+            self.txt_lab.insert("end", json.dumps(res, indent=2, ensure_ascii=False) + "\\n\\n")
+            self.txt_lab.see("end")
 
 if __name__ == "__main__":
-    app = App()
+    app = SleekApp()
     app.mainloop()
