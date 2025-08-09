@@ -1,83 +1,139 @@
-
+# app/ui/pages/devices_page.py
+import os
 import customtkinter as ctk
-from ...config import save_config
+
+# Robust imports
+try:
+    from ...core.audio import AudioCore
+    from ...config import save_config
+    from ..glass import GlassCard
+except ImportError:
+    from core.audio import AudioCore
+    from config import save_config
+    from app.ui.glass import GlassCard
+
 
 class DevicesPage(ctk.CTkFrame):
-    def __init__(self, master, core, cfg, log_fn, on_toggle_labs):
-        super().__init__(master, corner_radius=0)
-        self.core = core; self.cfg = cfg; self.log = log_fn; self.on_toggle_labs = on_toggle_labs
-        self.grid_columnconfigure(1, weight=1)
+    """
+    Devices / Settings page (glassmorphism)
+    - Input/Output device selectors
+    - Sample rate & duration
+    - Labs toggle (shows/hides Lab page)
+    """
+    def __init__(self, master, core: "AudioCore", cfg, log_fn, on_toggle_labs=None):
+        super().__init__(master, corner_radius=0, fg_color="transparent")
+        self.core = core
+        self.cfg = cfg
+        self.log = log_fn
+        self.on_toggle_labs = on_toggle_labs or (lambda _enabled: None)
 
-        ctk.CTkLabel(self, text="Devices / Settings", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, columnspan=2, padx=18, pady=(18,4), sticky="w")
+        self.grid_columnconfigure(0, weight=1)
 
-        card = ctk.CTkFrame(self); card.grid(row=1, column=0, columnspan=2, padx=18, pady=12, sticky="ew")
-        for i in range(6): card.grid_columnconfigure(i, weight=1)
-        ctk.CTkLabel(card, text="Sample Rate").grid(row=0, column=0, padx=8, pady=8, sticky="w")
-        self.sr_var = ctk.IntVar(value=self.cfg["last_settings"]["sample_rate"])
-        ctk.CTkEntry(card, textvariable=self.sr_var, width=120).grid(row=0, column=1, padx=8, pady=8, sticky="w")
-        ctk.CTkLabel(card, text="Signal Duration (s)").grid(row=0, column=2, padx=8, pady=8, sticky="w")
-        self.dur_var = ctk.DoubleVar(value=self.cfg["last_settings"]["duration"])
-        ctk.CTkEntry(card, textvariable=self.dur_var, width=120).grid(row=0, column=3, padx=8, pady=8, sticky="w")
-        ctk.CTkButton(card, text="Apply", command=self._apply).grid(row=0, column=5, padx=8, pady=8, sticky="e")
+        # Header
+        hdr = GlassCard(self); hdr.grid(row=0, column=0, padx=18, pady=(16, 8), sticky="ew")
+        h = hdr.inner
+        ctk.CTkLabel(h, text="Devices & Settings", font=ctk.CTkFont(size=20, weight="bold"))\
+            .grid(row=0, column=0, padx=14, pady=(12, 6), sticky="w")
+        ctk.CTkLabel(h, text="Select input / output, adjust sample rate and capture duration.")\
+            .grid(row=1, column=0, padx=14, pady=(0, 12), sticky="w")
 
-        dev = ctk.CTkFrame(self); dev.grid(row=2, column=0, columnspan=2, padx=18, pady=12, sticky="ew")
-        dev.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(dev, text="Output Device").grid(row=0, column=0, padx=8, pady=(8,4), sticky="w")
-        self.out_menu = ctk.CTkOptionMenu(dev, values=["<refresh>"]); self.out_menu.grid(row=0, column=1, padx=8, pady=(8,4), sticky="ew")
-        ctk.CTkLabel(dev, text="Input Device").grid(row=1, column=0, padx=8, pady=(4,8), sticky="w")
-        self.in_menu = ctk.CTkOptionMenu(dev, values=["<refresh>"]); self.in_menu.grid(row=1, column=1, padx=8, pady=(4,8), sticky="ew")
-        ctk.CTkButton(dev, text="Refresh Devices", command=self._refresh_devices).grid(row=0, column=2, rowspan=2, padx=8)
+        # Devices
+        dev = GlassCard(self); dev.grid(row=1, column=0, padx=18, pady=8, sticky="ew")
+        d = dev.inner
+        for i in range(2): d.grid_columnconfigure(i, weight=1)
 
-        ap = ctk.CTkFrame(self); ap.grid(row=3, column=0, columnspan=2, padx=18, pady=12, sticky="ew")
-        ap.grid_columnconfigure(3, weight=1)
-        ctk.CTkLabel(ap, text="Appearance").grid(row=0, column=0, padx=8, pady=8, sticky="w")
-        self.appearance = ctk.CTkOptionMenu(ap, values=["Light","Dark","System"]); self.appearance.set(self.cfg["ui"].get("appearance_mode", "Dark")); self.appearance.grid(row=0, column=1, padx=8, sticky="w")
-        ctk.CTkLabel(ap, text="Accent").grid(row=0, column=2, padx=8, pady=8, sticky="w")
-        self.color = ctk.CTkOptionMenu(ap, values=["blue","dark-blue","green"]); self.color.set(self.cfg["ui"].get("color_theme","blue")); self.color.grid(row=0, column=3, padx=8, sticky="w")
+        # Build device lists
+        outs = self.core.list_output_devices()
+        ins  = self.core.list_input_devices()
 
-        self.labs_var = ctk.BooleanVar(value=bool(self.cfg["ui"].get("labs_enabled", True)))
-        ctk.CTkSwitch(ap, text="Enable Lab Tests (experimental)", variable=self.labs_var, command=self._toggle_labs).grid(row=1, column=0, columnspan=2, padx=8, pady=(8,6), sticky="w")
+        self.var_out = ctk.StringVar(value=str(self.cfg["last_settings"].get("output_device_index", "")))
+        self.var_in  = ctk.StringVar(value=str(self.cfg["last_settings"].get("input_device_index", "")))
 
-        self._refresh_devices()
+        ctk.CTkLabel(d, text="Output Device").grid(row=0, column=0, padx=14, pady=(12, 6), sticky="w")
+        self.menu_out = ctk.CTkOptionMenu(
+            d,
+            values=[f"{i}: {name}" for i, name in outs],
+            command=lambda *_: self._apply_devices(),
+        )
+        self._set_menu_from_index(self.menu_out, outs, self.var_out.get())
+        self.menu_out.grid(row=1, column=0, padx=14, pady=(0, 12), sticky="ew")
 
-    def _apply(self):
+        ctk.CTkLabel(d, text="Input Device").grid(row=0, column=1, padx=14, pady=(12, 6), sticky="w")
+        self.menu_in = ctk.CTkOptionMenu(
+            d,
+            values=[f"{i}: {name}" for i, name in ins],
+            command=lambda *_: self._apply_devices(),
+        )
+        self._set_menu_from_index(self.menu_in, ins, self.var_in.get())
+        self.menu_in.grid(row=1, column=1, padx=14, pady=(0, 12), sticky="ew")
+
+        # Audio settings
+        s = GlassCard(self); s.grid(row=2, column=0, padx=18, pady=8, sticky="ew")
+        sett = s.inner
+        for i in range(6): sett.grid_columnconfigure(i, weight=1)
+
+        ctk.CTkLabel(sett, text="Sample Rate (Hz)").grid(row=0, column=0, padx=14, pady=(12, 6), sticky="w")
+        self.var_sr = ctk.StringVar(value=str(self.cfg["last_settings"].get("sample_rate", 48000)))
+        ctk.CTkEntry(sett, textvariable=self.var_sr, width=120).grid(row=0, column=1, padx=(8, 14), pady=(12,6), sticky="w")
+
+        ctk.CTkLabel(sett, text="Capture Duration (s)").grid(row=0, column=2, padx=14, pady=(12, 6), sticky="w")
+        self.var_dur = ctk.StringVar(value=str(self.cfg["last_settings"].get("duration", 3.0)))
+        ctk.CTkEntry(sett, textvariable=self.var_dur, width=120).grid(row=0, column=3, padx=(8,14), pady=(12,6), sticky="w")
+
+        ctk.CTkButton(sett, text="Apply", command=self._apply_audio)\
+           .grid(row=0, column=5, padx=14, pady=(12,6), sticky="e")
+
+        # Labs toggle
+        labs = GlassCard(self); labs.grid(row=3, column=0, padx=18, pady=(8,18), sticky="ew")
+        l = labs.inner
+        l.grid_columnconfigure(0, weight=1)
+        self.var_labs = ctk.BooleanVar(value=bool(self.cfg["ui"].get("labs_enabled", True)))
+        ctk.CTkSwitch(l, text="Enable Lab Tests", variable=self.var_labs, command=self._toggle_labs)\
+            .grid(row=0, column=0, padx=14, pady=(12, 12), sticky="w")
+
+    # helpers
+    def _set_menu_from_index(self, menu: ctk.CTkOptionMenu, items, idx_str):
         try:
-            self.core.sample_rate = int(self.sr_var.get())
-            self.core.duration = float(self.dur_var.get())
-            self.cfg["last_settings"]["sample_rate"] = self.core.sample_rate
-            self.cfg["last_settings"]["duration"] = self.core.duration
-            self.cfg["ui"]["appearance_mode"] = self.appearance.get()
-            self.cfg["ui"]["color_theme"] = self.color.get()
-            save_config(self.cfg)
-            self.log(f"[SET] sr={self.core.sample_rate}, dur={self.core.duration}s, theme={self.appearance.get()}/{self.color.get()}")
-        except Exception as e:
-            self.log(f"[ERROR] settings: {e}")
+            idx = int(idx_str)
+        except Exception:
+            idx = items[0][0] if items else 0
+        for i, name in items:
+            if i == idx:
+                menu.set(f"{i}: {name}")
+                return
+        if items:
+            menu.set(f"{items[0][0]}: {items[0][1]}")
 
-    def _refresh_devices(self):
-        devs = self.core.list_devices()
-        out_values, in_values = [], []
-        self._out_idx = {}; self._in_idx = {}
-        for i, info in enumerate(devs):
-            name = info.get("name","?"); m_in = int(info.get("maxInputChannels",0)); m_out=int(info.get("maxOutputChannels",0)); rate = int(info.get("defaultSampleRate",0))
-            label = f"[{i}] {name} (in:{m_in}, out:{m_out}, rate:{rate})"
-            if m_out>0: out_values.append(label); self._out_idx[label]=i
-            if m_in>0: in_values.append(label); self._in_idx[label]=i
-        self.out_menu.configure(values=out_values or ["<no outputs>"]); self.in_menu.configure(values=in_values or ["<no inputs>"])
-        out_stored = self.cfg["last_settings"].get("output_device_index")
-        in_stored = self.cfg["last_settings"].get("input_device_index")
-        if out_values:
-            target = next((lbl for lbl,idx in self._out_idx.items() if idx==out_stored), out_values[0]); self.out_menu.set(target)
-        if in_values:
-            target = next((lbl for lbl,idx in self._in_idx.items() if idx==in_stored), in_values[0]); self.in_menu.set(target)
-
-    def use_selected_devices(self):
-        out_idx = self._out_idx.get(self.out_menu.get()); in_idx = self._in_idx.get(self.in_menu.get())
-        if out_idx is None or in_idx is None: return
-        self.core.set_devices(output_index=out_idx, input_index=in_idx)
+    def _apply_devices(self):
+        out_txt = self.menu_out.get()
+        in_txt  = self.menu_in.get()
+        try:
+            out_idx = int(out_txt.split(":")[0])
+            in_idx  = int(in_txt.split(":")[0])
+        except Exception:
+            return
         self.cfg["last_settings"]["output_device_index"] = out_idx
-        self.cfg["last_settings"]["input_device_index"] = in_idx
-        save_config(self.cfg); self.log(f"[SET] devices out={out_idx}, in={in_idx}")
+        self.cfg["last_settings"]["input_device_index"]  = in_idx
+        save_config(self.cfg)
+        self.core.set_devices(output_device_index=out_idx, input_device_index=in_idx)
+        self.log(f"[DEV] Output={out_idx}, Input={in_idx}")
+
+    def _apply_audio(self):
+        try:
+            sr = int(float(self.var_sr.get()))
+            dur = float(self.var_dur.get())
+        except Exception:
+            self.log("[WARN] invalid sample rate or duration")
+            return
+        self.cfg["last_settings"]["sample_rate"] = sr
+        self.cfg["last_settings"]["duration"] = dur
+        save_config(self.cfg)
+        self.core.set_timing(sample_rate=sr, duration=dur)
+        self.log(f"[AUDIO] SR={sr}, DUR={dur}s")
 
     def _toggle_labs(self):
-        self.cfg["ui"]["labs_enabled"] = bool(self.labs_var.get()); save_config(self.cfg)
-        self.on_toggle_labs(bool(self.labs_var.get()))
+        enabled = bool(self.var_labs.get())
+        self.cfg["ui"]["labs_enabled"] = enabled
+        save_config(self.cfg)
+        self.on_toggle_labs(enabled)
+        self.log(f"[UI] Labs enabled={enabled}")
