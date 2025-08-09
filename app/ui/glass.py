@@ -1,7 +1,7 @@
 # app/ui/glass.py
 import os, sys
 import customtkinter as ctk
-from PIL import Image, ImageFilter, ImageEnhance, ImageTk  # Pillow is required
+from PIL import Image, ImageFilter, ImageEnhance, ImageTk  # Pillow required
 
 def resource_path(rel: str) -> str:
     base = getattr(sys, "_MEIPASS", os.path.abspath("."))
@@ -42,28 +42,39 @@ class Background(ctk.CTkLabel):
 
 class GlassCard(ctk.CTkFrame):
     """
-    'Glass' card using only solid colors (no alpha hex):
+    'Glass' card (no alpha hex; grid-only layout inside):
     - outer frame is transparent so the blurred bg shows through
-    - inner frame uses very light/dark solids to *suggest* translucency
+    - panel is the frosted area with a thin top divider "shine"
+    - inner is where YOU place widgets (using grid)
     """
     def __init__(self, master, **kwargs):
-        # IMPORTANT: single 'transparent' string (not a tuple)
         super().__init__(master, corner_radius=18, fg_color="transparent", **kwargs)
 
-        # Choose gentle solids for light/dark modes (no alpha)
-        inner_fg = ("#F5F7FA", "#171A1F")      # light / dark
-        border_fg = ("#E2E8F0", "#2A2F3A")     # subtle border
-        shine_fg  = ("#FFFFFF", "#2B2F36")     # thin top "shine" divider
+        # subtle solids for light/dark themes
+        panel_fg  = ("#F5F7FA", "#171A1F")   # frosted body
+        border_fg = ("#E2E8F0", "#2A2F3A")   # border
+        shine_fg  = ("#FFFFFF", "#2B2F36")   # thin top divider
 
-        self.inner = ctk.CTkFrame(
-            self,
-            corner_radius=18,
-            fg_color=inner_fg,
-            border_width=1,
-            border_color=border_fg,
+        # make the outer container a single grid cell
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        # frosted panel
+        self.panel = ctk.CTkFrame(
+            self, corner_radius=18,
+            fg_color=panel_fg,
+            border_width=1, border_color=border_fg,
         )
-        self.inner.pack(fill="both", expand=True, padx=1, pady=1)
+        self.panel.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
 
-        # Subtle top shine line (solid color only)
-        self.shine = ctk.CTkFrame(self.inner, height=1, fg_color=shine_fg)
-        self.shine.pack(fill="x", side="top")
+        # grid inside panel: row 0 = shine, row 1 = content
+        self.panel.grid_rowconfigure(1, weight=1)
+        self.panel.grid_columnconfigure(0, weight=1)
+
+        # top shine line (use grid, not pack)
+        self.shine = ctk.CTkFrame(self.panel, height=1, fg_color=shine_fg)
+        self.shine.grid(row=0, column=0, sticky="ew")
+
+        # content area where pages can put widgets via grid
+        self.inner = ctk.CTkFrame(self.panel, corner_radius=18, fg_color="transparent")
+        self.inner.grid(row=1, column=0, sticky="nsew")
