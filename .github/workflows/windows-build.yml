@@ -25,13 +25,8 @@ jobs:
           pip install pyinstaller
 
       - name: Build EXE
-        run: |
-          pyinstaller --onefile --noconsole ^
-            --name "Pawdio-Lab" ^
-            --icon paw.ico ^
-            --add-data "paw.png;." --add-data "paw.ico;." ^
-            -p app app/main.py
-          dir dist
+  run: pyinstaller --onefile --noconsole --name "Pawdio-Lab" --icon paw.ico --add-data "paw.png;." --add-data "paw.ico;." -p app app/main.py
+
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
