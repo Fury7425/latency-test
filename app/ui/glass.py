@@ -1,14 +1,14 @@
 # app/ui/glass.py
 import os, sys
 import customtkinter as ctk
-from PIL import Image, ImageFilter, ImageEnhance, ImageTk  # <- ImageTk is important
-from tkinter import PhotoImage
+from PIL import Image, ImageFilter, ImageEnhance, ImageTk  # Pillow is required
 
 def resource_path(rel: str) -> str:
     base = getattr(sys, "_MEIPASS", os.path.abspath("."))
     return os.path.join(base, rel)
 
 def make_background(path, size, blur=18, darken=0.18, desaturate=0.05):
+    """Return a blurred/dimmed PIL.Image matching the given size."""
     img = Image.open(path).convert("RGB")
     w, h = size
     img = img.resize((max(1, w), max(1, h)), Image.LANCZOS)
@@ -35,7 +35,6 @@ class Background(ctk.CTkLabel):
         h = max(300, self.winfo_height() or self.winfo_reqheight())
         try:
             img = make_background(self._image_path, (w, h))
-            # Use ImageTk.PhotoImage, not tk.PhotoImage
             self._photo = ImageTk.PhotoImage(img)
             self.configure(image=self._photo)
         except Exception:
@@ -43,24 +42,28 @@ class Background(ctk.CTkLabel):
 
 class GlassCard(ctk.CTkFrame):
     """
-    'Glass' card:
-    - parent frame is transparent so background shows through
-    - inner frame has a faint frosted color + subtle border
+    'Glass' card using only solid colors (no alpha hex):
+    - outer frame is transparent so the blurred bg shows through
+    - inner frame uses very light/dark solids to *suggest* translucency
     """
     def __init__(self, master, **kwargs):
-        # IMPORTANT: pass a SINGLE 'transparent' string
+        # IMPORTANT: single 'transparent' string (not a tuple)
         super().__init__(master, corner_radius=18, fg_color="transparent", **kwargs)
 
-        # inner frosted layer (no real alpha in CTk; choose soft light/dark colors)
+        # Choose gentle solids for light/dark modes (no alpha)
+        inner_fg = ("#F5F7FA", "#171A1F")      # light / dark
+        border_fg = ("#E2E8F0", "#2A2F3A")     # subtle border
+        shine_fg  = ("#FFFFFF", "#2B2F36")     # thin top "shine" divider
+
         self.inner = ctk.CTkFrame(
             self,
             corner_radius=18,
-            fg_color=("#F3F6F91A", "#0E11141A"),  # light/dark soft tint; CTk accepts short alpha in hex on recent versions; if not, swap to "#F3F6F9" / "#0E1114"
+            fg_color=inner_fg,
             border_width=1,
-            border_color=("#FFFFFF33", "#FFFFFF22"),
+            border_color=border_fg,
         )
         self.inner.pack(fill="both", expand=True, padx=1, pady=1)
 
-        # subtle top shine
-        self.shine = ctk.CTkFrame(self.inner, height=1, fg_color=("#FFFFFF55", "#FFFFFF22"))
+        # Subtle top shine line (solid color only)
+        self.shine = ctk.CTkFrame(self.inner, height=1, fg_color=shine_fg)
         self.shine.pack(fill="x", side="top")
