@@ -3,8 +3,13 @@ import os
 import json
 import customtkinter as ctk
 
-from ...tests import balance, crosstalk, sweep_fr, thd, isolation
-from ...core.utils import ensure_dir
+# Robust imports: package layout (app/...) or flat layout
+try:
+    from ...tests import balance, crosstalk, sweep_fr, thd, isolation
+    from ...core.utils import ensure_dir
+except ImportError:
+    from tests import balance, crosstalk, sweep_fr, thd, isolation
+    from core.utils import ensure_dir
 
 
 class LabPage(ctk.CTkFrame):
@@ -67,7 +72,7 @@ class LabPage(ctk.CTkFrame):
         fr.grid(row=2, column=0, padx=18, pady=12, sticky="nsew")
 
         self.var_dur = ctk.StringVar(value="6.0")
-        self.var_repeats = ctk.StringVar(value="3")  # NEW: number of runs
+        self.var_repeats = ctk.StringVar(value="3")  # number of runs
 
         ctk.CTkLabel(fr, text="Sweep FR (relative)").grid(
             row=0, column=0, sticky="w", padx=8, pady=(8, 4)
@@ -77,8 +82,8 @@ class LabPage(ctk.CTkFrame):
             row=1, column=1, sticky="w", padx=8
         )
 
-        ctk.CTkLabel(fr, text="Repeats").grid(row=1, column=2, sticky="w", padx=8)  # NEW
-        ctk.CTkEntry(fr, textvariable=self.var_repeats, width=90).grid(              # NEW
+        ctk.CTkLabel(fr, text="Repeats").grid(row=1, column=2, sticky="w", padx=8)
+        ctk.CTkEntry(fr, textvariable=self.var_repeats, width=90).grid(
             row=1, column=3, sticky="w", padx=8
         )
 
@@ -152,7 +157,7 @@ class LabPage(ctk.CTkFrame):
             self.core,
             self.log,
             duration=float(self.var_dur.get()),
-            repeats=int(self.var_repeats.get()),  # pass repeats to multi-run sweep
+            repeats=int(self.var_repeats.get()),
             save_plot_dir=out,
         )
         self._push(r)
@@ -179,8 +184,8 @@ class LabPage(ctk.CTkFrame):
         out_dir = self.cfg["last_settings"].get("output_dir", os.getcwd())
         ensure_dir(out_dir)
         last = self.results[-1]
-        import datetime
 
+        import datetime
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(out_dir, f"lab_last_{ts}.json")
         with open(path, "w", encoding="utf-8") as f:
@@ -192,8 +197,8 @@ class LabPage(ctk.CTkFrame):
             return
         out_dir = self.cfg["last_settings"].get("output_dir", os.getcwd())
         ensure_dir(out_dir)
-        import datetime
 
+        import datetime
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(out_dir, f"lab_all_{ts}.json")
         with open(path, "w", encoding="utf-8") as f:
