@@ -1,5 +1,4 @@
 # app/ui/pages/devices_page.py
-import os
 import customtkinter as ctk
 
 # Robust imports
@@ -10,7 +9,7 @@ except ImportError:
     from config import save_config
     from app.ui.glass import GlassCard
 
-# We’ll use PyAudio directly if AudioCore doesn’t provide list_* helpers
+# PyAudio fallback for enumeration
 try:
     import pyaudio
 except Exception:
@@ -18,12 +17,6 @@ except Exception:
 
 
 class DevicesPage(ctk.CTkFrame):
-    """
-    Devices / Settings page (glassmorphism)
-    - Enumerates I/O devices via AudioCore if available, otherwise via PyAudio
-    - Sample rate & duration controls
-    - Labs toggle
-    """
     def __init__(self, master, core, cfg, log_fn, on_toggle_labs=None):
         super().__init__(master, corner_radius=0, fg_color="transparent")
         self.core = core
@@ -48,13 +41,21 @@ class DevicesPage(ctk.CTkFrame):
 
         outs = self._list_output_devices(core)
         ins  = self._list_input_devices(core)
-
-        # fallbacks if enumeration failed
         if not outs: outs = [(0, "Default Output")]
         if not ins:  ins  = [(0, "Default Input")]
 
-        self.var_out = ctk.StringVar(value=str(self.cfg["last_settings"].get("output_device_index", outs[0][0])))
-        self.var_in  = ctk.StringVar(value=str(self.cfg["last_settings"].get("input_device_index",  ins[0][0])))
+        # read saved indexes safely
+        out_idx_saved = self.cfg["last_settings"].get("output_device_index", None)
+        in_idx_saved  = self.cfg["last_settings"].get("input_device_index", None)
+
+        out_idx_default = outs[0][0]
+        in_idx_default  = ins[0][0]
+
+        out_idx = out_idx_default if not self._is_int(out_idx_saved) else int(out_idx_saved)
+        in_idx  = in_idx_default  if not self._is_int(in_idx_saved)  else int(in_idx_saved)
+
+        self.var_out = ctk.StringVar(value=str(out_idx))
+        self.var_in  = ctk.StringVar(value=str(in_idx))
 
         ctk.CTkLabel(d, text="Output Device").grid(row=0, column=0, padx=14, pady=(12, 6), sticky="w")
         self.menu_out = ctk.CTkOptionMenu(
@@ -62,7 +63,7 @@ class DevicesPage(ctk.CTkFrame):
             values=[f"{i}: {name}" for i, name in outs],
             command=lambda *_: self._apply_devices()
         )
-        self._set_menu_from_index(self.menu_out, outs, int(self.var_out.get()))
+        self._set_menu_from_index(self.menu_out, outs, out_idx)
         self.menu_out.grid(row=1, column=0, padx=14, pady=(0, 12), sticky="ew")
 
         ctk.CTkLabel(d, text="Input Device").grid(row=0, column=1, padx=14, pady=(12, 6), sticky="w")
@@ -71,7 +72,7 @@ class DevicesPage(ctk.CTkFrame):
             values=[f"{i}: {name}" for i, name in ins],
             command=lambda *_: self._apply_devices()
         )
-        self._set_menu_from_index(self.menu_in, ins, int(self.var_in.get()))
+        self._set_menu_from_index(self.menu_in, ins, in_idx)
         self.menu_in.grid(row=1, column=1, padx=14, pady=(0, 12), sticky="ew")
 
         # Audio settings
@@ -79,12 +80,15 @@ class DevicesPage(ctk.CTkFrame):
         sett = s.inner
         for i in range(6): sett.grid_columnconfigure(i, weight=1)
 
+        sr_saved  = self.cfg["last_settings"].get("sample_rate", 48000)
+        dur_saved = self.cfg["last_settings"].get("duration", 3.0)
+        self.var_sr  = ctk.StringVar(value=str(sr_saved))
+        self.var_dur = ctk.StringVar(value=str(dur_saved))
+
         ctk.CTkLabel(sett, text="Sample Rate (Hz)").grid(row=0, column=0, padx=14, pady=(12, 6), sticky="w")
-        self.var_sr = ctk.StringVar(value=str(self.cfg["last_settings"].get("sample_rate", 48000)))
         ctk.CTkEntry(sett, textvariable=self.var_sr, width=120).grid(row=0, column=1, padx=(8, 14), pady=(12,6), sticky="w")
 
         ctk.CTkLabel(sett, text="Capture Duration (s)").grid(row=0, column=2, padx=14, pady=(12, 6), sticky="w")
-        self.var_dur = ctk.StringVar(value=str(self.cfg["last_settings"].get("duration", 3.0)))
         ctk.CTkEntry(sett, textvariable=self.var_dur, width=120).grid(row=0, column=3, padx=(8,14), pady=(12,6), sticky="w")
 
         ctk.CTkButton(sett, text="Apply", command=self._apply_audio)\
@@ -100,38 +104,28 @@ class DevicesPage(ctk.CTkFrame):
 
     # ---------- enumeration helpers ----------
     def _list_output_devices(self, core):
-        # Use AudioCore method if present
         if hasattr(core, "list_output_devices"):
-            try:
-                return list(core.list_output_devices())
-            except Exception:
-                pass
-        # Fallback to PyAudio
+            try: return list(core.list_output_devices())
+            except Exception: pass
         return self._pyaudio_enum(kind="output")
 
     def _list_input_devices(self, core):
         if hasattr(core, "list_input_devices"):
-            try:
-                return list(core.list_input_devices())
-            except Exception:
-                pass
+            try: return list(core.list_input_devices())
+            except Exception: pass
         return self._pyaudio_enum(kind="input")
 
     def _pyaudio_enum(self, kind="output"):
         devs = []
-        if pyaudio is None:
-            return devs
+        if pyaudio is None: return devs
         try:
             pa = pyaudio.PyAudio()
-            count = pa.get_device_count()
-            for i in range(count):
+            for i in range(pa.get_device_count()):
                 info = pa.get_device_info_by_index(i)
                 name = info.get("name", f"Device {i}")
-                max_in  = int(info.get("maxInputChannels", 0))
-                max_out = int(info.get("maxOutputChannels", 0))
-                if kind == "output" and max_out > 0:
+                if kind == "output" and int(info.get("maxOutputChannels", 0)) > 0:
                     devs.append((i, name))
-                if kind == "input" and max_in > 0:
+                if kind == "input" and int(info.get("maxInputChannels", 0)) > 0:
                     devs.append((i, name))
             pa.terminate()
         except Exception:
@@ -139,8 +133,14 @@ class DevicesPage(ctk.CTkFrame):
         return devs
 
     # ---------- apply handlers ----------
+    def _is_int(self, v):
+        try:
+            int(v)
+            return True
+        except Exception:
+            return False
+
     def _set_menu_from_index(self, menu: ctk.CTkOptionMenu, items, idx):
-        # items: list[(index, name)]
         chosen = None
         for i, name in items:
             if i == idx:
@@ -152,7 +152,6 @@ class DevicesPage(ctk.CTkFrame):
             menu.set(chosen)
 
     def _apply_devices(self):
-        # parse "idx: name"
         try:
             out_idx = int(self.menu_out.get().split(":")[0])
             in_idx  = int(self.menu_in.get().split(":")[0])
@@ -163,7 +162,6 @@ class DevicesPage(ctk.CTkFrame):
         self.cfg["last_settings"]["input_device_index"]  = in_idx
         save_config(self.cfg)
 
-        # If AudioCore exposes setter, use it; else ignore silently
         if hasattr(self.core, "set_devices"):
             try:
                 self.core.set_devices(output_device_index=out_idx, input_device_index=in_idx)
@@ -189,7 +187,6 @@ class DevicesPage(ctk.CTkFrame):
             except Exception as e:
                 self.log(f"[AUDIO] set_timing failed: {e}")
         else:
-            # best-effort mutation for simple cores
             try:
                 self.core.sample_rate = sr
                 self.core.duration = dur
