@@ -1,6 +1,17 @@
+# Core GUI and audio stack
+customtkinter>=5.2.0
+pyaudio>=0.2.14
+numpy>=1.26.0
+matplotlib>=3.8.0
 
-numpy
-scipy
-matplotlib
-pyaudio
-customtkinter
+# For glassmorphism background + image handling
+pillow>=9.5.0
+
+# For signal processing in tests
+scipy>=1.12.0
+
+# Optional but recommended: progress bars/log formatting
+tqdm>=4.66.0
+
+# If you save/export JSON/CSV or use pandas in results
+pandas>=2.2.0
